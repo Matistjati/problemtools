@@ -18,5 +18,5 @@ def add_version_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         '--version',
         action='version',
-        version=f'%(prog)s {version}. Supports problem format {FormatVersion.LEGACY}, and partial (experimental) support for {FormatVersion.V_2023_07}',
+        version=f'%(prog)s {version}. Supports problem format {FormatVersion.LEGACY}, and partial (experimental) support for {FormatVersion.V_2025_09}',
     )

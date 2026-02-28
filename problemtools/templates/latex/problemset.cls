@@ -74,6 +74,20 @@
 \fi
 
 %% Commands used to set name, logo, etc of contest
+
+%% Constants support (2025-09)
+%% \defconstant{name}{value} defines a constant
+%% \constant{name} expands to the constant's value
+\newcommand{\defconstant}[2]{\expandafter\def\csname pt@const@#1\endcsname{#2}}
+\newcommand{\constant}[1]{%
+  \@ifundefined{pt@const@#1}{%
+    \PackageWarning{problemset}{Undefined constant: #1}%
+    \textbf{??#1??}%
+  }{%
+    \csname pt@const@#1\endcsname%
+  }%
+}
+
 \newcommand*{\contestname}[1]{\def\@contestname{#1}}
 \newcommand*{\contestshortname}[1]{\def\@contestshortname{#1}}
 \newcommand*{\contestlogo}[1]{\def\@contestlogo{#1}}
@@ -295,6 +309,28 @@
 %% Sample counter
 \newcounter{samplenum}
 \newcommand{\sampleid}{\arabic{samplenum}}
+
+%% Counter for \nextsample command
+\newcounter{pt@nextsamplenum}
+
+%% \nextsample: include the next sample test case inline
+\ifplastex\else
+\newcommand{\nextsample}{%
+  \stepcounter{pt@nextsamplenum}%
+  \includesample{\arabic{pt@nextsamplenum}}%
+}
+%% \remainingsamples: include all remaining sample test cases
+\newcommand{\remainingsamples}{%
+  \stepcounter{pt@nextsamplenum}%
+  \foreach \PT@SN in {\arabic{pt@nextsamplenum},...,99} {%
+    \IfFileExists{\@problempath{\@problemid}/data/sample/\PT@SN.in}{%
+      \includesample{\PT@SN}%
+    }{\IfFileExists{\@problempath{\@problemid}/data/sample/\PT@SN.interaction}{%
+      \includesample{\PT@SN}%
+    }{}}%
+  }%
+}
+\fi
 
 %% Define the command used to give sample data
 %% Takes filename as parameter

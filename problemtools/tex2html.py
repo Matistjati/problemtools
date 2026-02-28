@@ -4,6 +4,7 @@ import string
 import argparse
 from pathlib import Path
 
+from . import statement_util
 from . import template
 
 
@@ -31,6 +32,10 @@ def convert(problem_root: Path, options: argparse.Namespace, statement_file: Pat
         tex = plasTeX.TeX.TeX(file=texfile)
 
         ProblemsetMacros.init(tex)
+
+        # Load constants from problem.yaml for \constant{} command
+        constants = statement_util.load_constants(problem_root)
+        tex.ownerDocument.userdata['constants'] = constants
 
         tex.ownerDocument.config['general']['copy-theme-extras'] = options.css
         if not options.headers:

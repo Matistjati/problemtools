@@ -2,9 +2,10 @@ import copy
 import datetime
 import re
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Self, Type, Union
+from typing import Any, Literal, Type, Union
+
+from ._compat import Self, StrEnum
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -94,7 +95,7 @@ class Credits:
 @dataclass
 class InputCredits:
     """
-    A more permissive dataclass for credits, as the input in 2023-07 looks.
+    A more permissive dataclass for credits, as the input in 2025-09 looks.
     For use when validating input.
     """
 
@@ -109,9 +110,9 @@ class InputCredits:
     acknowledgements: PersonOrPersons = field(default_factory=list)
 
 
-class Metadata2023_07(BaseModel):
+class Metadata2025_09(BaseModel):
     """
-    The metadata for a problem as input in version 2023-07-draft.
+    The metadata for a problem as input in version 2025-09.
     """
 
     problem_format_version: str
@@ -127,8 +128,8 @@ class Metadata2023_07(BaseModel):
     limits: Limits
     keywords: list[str] = []
     languages: list[str] | Literal['all'] = 'all'
-    allow_file_writing: bool = True
-    constants: dict[str, int | float | str] = {}
+    allow_file_writing: bool = False
+    constants: dict[str, int | float | str | dict[str, int | float | str]] = {}
 
     model_config = ConfigDict(extra='forbid')
 
@@ -185,10 +186,10 @@ class MetadataLegacy(BaseModel):
 class Metadata(BaseModel):
     """
     The metadata for a problem, as used internally in problemtools. Closely
-    follows the 2023-07-draft version, but is more fully parsed, and adds
-    a few legacy fields to represent information not in 2023-07.
+    follows the 2025-09 version, but is more fully parsed, and adds
+    a few legacy fields to represent information not in 2025-09.
 
-    Metadata serializes to a valid 2023-07-draft configuration.
+    Metadata serializes to a valid 2025-09 configuration.
     """
 
     problem_format_version: FormatVersion
@@ -223,14 +224,14 @@ class Metadata(BaseModel):
         match self.problem_format_version:
             case FormatVersion.LEGACY:
                 return self.legacy_custom_score
-            case FormatVersion.V_2023_07:
+            case FormatVersion.V_2025_09:
                 return self.is_scoring()
 
     def is_custom_score_mandatory(self) -> bool:
         match self.problem_format_version:
             case FormatVersion.LEGACY:
                 return self.legacy_custom_score
-            case FormatVersion.V_2023_07:
+            case FormatVersion.V_2025_09:
                 return False
 
     def is_interactive(self) -> bool:
@@ -293,8 +294,8 @@ class Metadata(BaseModel):
         return cls.model_validate(metadata)
 
     @classmethod
-    def from_2023_07(cls: Type[Self], md2023_07: Metadata2023_07) -> Self:
-        metadata = md2023_07.model_dump()
+    def from_2025_09(cls: Type[Self], md2025_09: Metadata2025_09) -> Self:
+        metadata = md2025_09.model_dump()
         metadata['type'] = [metadata['type']] if isinstance(metadata['type'], str) else metadata['type']
         metadata['name'] = {'en': metadata['name']} if isinstance(metadata['name'], str) else metadata['name']
 
@@ -350,9 +351,9 @@ def parse_metadata(
         legacy_model = MetadataLegacy.model_validate(data)
         return Metadata.from_legacy(legacy_model, names_from_statements or {})
     else:
-        assert version is FormatVersion.V_2023_07
-        model_2023_07 = Metadata2023_07.model_validate(data)
-        return Metadata.from_2023_07(model_2023_07)
+        assert version is FormatVersion.V_2025_09
+        model_2025_09 = Metadata2025_09.model_validate(data)
+        return Metadata.from_2025_09(model_2025_09)
 
 
 def load_metadata(problem_root: Path) -> tuple[Metadata, dict]:

@@ -25,8 +25,14 @@ def convert(problem_root: Path, options: argparse.Namespace, statement_file: Pat
     destfile = string.Template(options.destfile).safe_substitute(problem=problem_root.name)
     imgbasedir = string.Template(options.imgbasedir).safe_substitute(problem=problem_root.name)
 
-    command = ['pandoc', str(statement_file), '-t', 'html', '--mathjax']
-    statement_html = subprocess.run(command, capture_output=True, text=True, shell=False, check=True).stdout
+    # Read markdown and substitute constants before pandoc processing
+    md_content = statement_file.read_text(encoding='utf-8')
+    constants = statement_util.load_constants(problem_root)
+    if constants:
+        md_content, _undef = statement_util.substitute_constants(md_content, constants)
+
+    command = ['pandoc', '-t', 'html', '--mathjax']
+    statement_html = subprocess.run(command, input=md_content, capture_output=True, text=True, shell=False, check=True).stdout
 
     statement_html = sanitize_html(statement_file.parent, statement_html, imgbasedir)
 

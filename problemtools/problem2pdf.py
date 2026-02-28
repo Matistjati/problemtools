@@ -40,9 +40,15 @@ def md2pdf(options: argparse.Namespace, statement_file: Path) -> bool:
 
     statement_util.assert_images_are_valid_md(statement_file)
 
-    command = ['pandoc', str(statement_file), '-t', 'latex']
+    # Read markdown and substitute constants before pandoc processing
+    md_content = statement_file.read_text(encoding='utf-8')
+    constants = statement_util.load_constants(problem_root)
+    if constants:
+        md_content, _undef = statement_util.substitute_constants(md_content, constants)
+
+    command = ['pandoc', '-t', 'latex']
     try:
-        tex = subprocess.run(command, capture_output=True, text=True, shell=False, check=True).stdout
+        tex = subprocess.run(command, input=md_content, capture_output=True, text=True, shell=False, check=True).stdout
     except subprocess.CalledProcessError as e:
         print(f'Error compiling Markdown to pdf: {e.stderr}')
         return False

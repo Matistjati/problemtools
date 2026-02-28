@@ -1,6 +1,7 @@
 import sys
 import os
 import os.path
+import yaml
 from plasTeX.DOM import Node
 from plasTeX.Base import Command
 from plasTeX.Base import DimenCommand
@@ -163,6 +164,55 @@ class selectfont(Command):
 
 # Dummy for \ExecuteOptions to suppress warnings.
 class ExecuteOptions(Command):
+    pass
+
+
+# \constant{name} or \constant{name.variant}
+class constant(Command):
+    """Expand to the value of a constant defined in problem.yaml."""
+    args = 'name:str'
+
+    def invoke(self, tex):
+        res = super().invoke(tex)
+        name_str = self.attributes['name']
+        constants = self.ownerDocument.userdata.get('constants', {})
+
+        # Parse name.variant
+        parts = name_str.split('.', 1)
+        name = parts[0]
+        variant = parts[1] if len(parts) > 1 else None
+
+        if name not in constants:
+            log.warning('Undefined constant: %s', name_str)
+            return res
+
+        value = constants[name]
+        if isinstance(value, dict):
+            key = variant or 'value'
+            if key not in value:
+                log.warning('Undefined constant variant: %s', name_str)
+                return res
+            text_value = str(value[key])
+        else:
+            if variant is not None and variant != 'value':
+                log.warning('Undefined constant variant: %s', name_str)
+                return res
+            text_value = str(value)
+
+        # Insert the value as text
+        node = self.ownerDocument.createTextNode(text_value)
+        self.appendChild(node)
+        return res
+
+
+# \nextsample: placeholder for inline sample inclusion in LaTeX statements
+# In the PlasTeX pipeline, sample injection is handled separately
+class nextsample(Command):
+    pass
+
+
+# \remainingsamples: placeholder for remaining sample inclusion
+class remainingsamples(Command):
     pass
 
 

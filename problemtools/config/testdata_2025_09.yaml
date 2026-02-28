@@ -1,0 +1,17 @@
+# Default test data group configuration for the 2025-09 problem format.
+# Keys from the legacy format (on_reject, grading, grader_flags, accept_score,
+# reject_score, range, input_validator_flags, output_validator_flags) are not
+# used here.
+
+# max_score: defaults differ by context (100 for secret, unbounded otherwise)
+# score_aggregation: defaults differ by context (sum for secret, pass-fail otherwise)
+# static_validation_score: no default (optional)
+# require_pass: no default (optional, sequence of strings)
+
+args: []
+input_validator_args: []
+output_validator_args: []
+input_visualizer_args: []
+output_visualizer_args: []
+static_validator_args: []
+full_feedback: false

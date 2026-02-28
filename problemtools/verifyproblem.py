@@ -167,7 +167,7 @@ class ProblemAspect(ABC):
         self._add_warning()
         self.log.warning(self.__append_additional_info(msg, additional_info), *args)
 
-    def error_in_2023_07(self, msg: str, additional_info: str | None = None, *args) -> None:
+    def error_in_2025_09(self, msg: str, additional_info: str | None = None, *args) -> None:
         if self.problem.format is FormatVersion.LEGACY:
             self.warning(msg, additional_info, *args)
         else:
@@ -229,16 +229,49 @@ class ProblemPart(ProblemAspect):
 class TestCase(ProblemAspect):
     Result = tuple[SubmissionResult, SubmissionResult, SubmissionResult]
 
+    # Keys allowed in per-test-case YAML (2025-09)
+    _ALLOWED_TESTCASE_YAML_KEYS = frozenset({
+        'args', 'input_validator_args', 'output_validator_args',
+        'input_visualizer_args', 'output_visualizer_args',
+        'full_feedback', 'hint', 'description',
+    })
+
     def __init__(self, problem: Problem, base: str, testcasegroup: TestCaseGroup) -> None:
         super().__init__(f'{problem.shortname}.test.{testcasegroup.name}.{os.path.basename(base)}', problem)
         self._base = base
         self.infile = f'{base}.in'
         self.ansfile = f'{base}.ans'
+        self.outfile = f'{base}.out' if os.path.isfile(f'{base}.out') else None
+        self.filesdir = f'{base}.files' if os.path.isdir(f'{base}.files') else None
         self._problem = problem
         self.testcasegroup = testcasegroup
         self.reuse_result_from: TestCase | None = None
         self.counter = len(problem.testcase_by_infile)
         problem.testcase_by_infile[self.infile] = self
+
+        # Per-test-case configuration (2025-09)
+        self.tc_config: dict[str, Any] = {}
+        self._load_testcase_yaml()
+
+    def _load_testcase_yaml(self) -> None:
+        """Load per-test-case YAML configuration if it exists (2025-09)."""
+        if self._problem.format is not FormatVersion.V_2025_09:
+            return
+        yaml_file = f'{self._base}.yaml'
+        if os.path.isfile(yaml_file):
+            try:
+                with open(yaml_file) as f:
+                    data = yaml.safe_load(f)
+                if data is not None:
+                    if not isinstance(data, dict):
+                        self.error(f'Per-test-case YAML {yaml_file} must be a mapping')
+                    else:
+                        for key in data:
+                            if key not in TestCase._ALLOWED_TESTCASE_YAML_KEYS:
+                                self.warning(f"Unknown key '{key}' in per-test-case YAML {yaml_file}")
+                        self.tc_config = data
+            except Exception as e:
+                self.error(f'Failed to parse per-test-case YAML {yaml_file}: {e}')
 
     def check_newlines(self, filename: str) -> None:
         with open(filename, 'rb') as f:
@@ -294,6 +327,15 @@ class TestCase(ProblemAspect):
                     self.error(f'judge answer file got {val_res} on testcase {self.strip_path_prefix(self.ansfile)}')
                 else:
                     self.warning(f'judge answer file got {val_res} on testcase {self.strip_path_prefix(self.ansfile)}')
+
+        # 2025-09: Validate .out file (display override) must pass output validation
+        if self.outfile is not None and self._problem.format is FormatVersion.V_2025_09:
+            self.check_newlines(self.outfile)
+            if not self._problem.is_interactive():
+                out_res = self._problem.output_validators.validate(self, self.outfile)
+                if out_res.verdict != 'AC':
+                    self.error(f'.out file {os.path.basename(self.outfile)} failed output validation: {out_res}')
+
         self._check_symlinks()
         return self._check_res
 
@@ -342,6 +384,14 @@ class TestCase(ProblemAspect):
         self.info(f'{msg}: {res}')
         if res.verdict != 'AC' and self.is_in_sample_group():
             res.sample_failures.append(res)
+
+        # Track per-testcase verdict for submissions.yaml (2025-09)
+        if self._problem.format is FormatVersion.V_2025_09:
+            data_dir = os.path.join(self._problem.probdir, 'data')
+            tc_path = os.path.relpath(self.infile, data_dir)
+            if tc_path.endswith('.in'):
+                tc_path = tc_path[:-3]
+            self._problem._testcase_verdicts[tc_path] = res
 
         return (res, res_low, res_high)
 
@@ -412,24 +462,17 @@ class TestCase(ProblemAspect):
 
     def run_submission_real(self, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float) -> Result:
         # This may be called off-main thread.
-
-        feedback_dir = Path(tempfile.mkdtemp(prefix=f'feedback-{self.counter}-', dir=self.problem.tmpdir))
+        # Get per-test-case args (2025-09): from test case YAML, falling back to group config
+        tc_args = None
+        if self._problem.format is FormatVersion.V_2025_09:
+            tc_args = self.tc_config.get('args', self.testcasegroup.config.get('args', None)) or None
 
         if self._problem.is_interactive():
-
-            def run_submission(infile: Path) -> SubmissionResult:
-                return self._problem.output_validators.validate_interactive(
-                    self, sub, timelim_high, self._problem.submissions, str(infile), str(feedback_dir)
-                )
+            res_high = self._problem.output_validators.validate_interactive(self, sub, timelim_high, self._problem.submissions)
+        elif self._problem.is_multi_pass():
+            res_high = self._run_multi_pass(sub, tc_args, timelim_high)
         else:
-
-            def run_submission(infile: Path) -> SubmissionResult:
-                return self.run_normal(sub, infile, timelim_high, feedback_dir)
-
-        if self._problem.is_multi_pass():
-            res_high = self.run_submission_multipass(feedback_dir, run_submission)
-        else:
-            res_high = run_submission(Path(self.infile))
+            res_high = self._run_single_pass(sub, tc_args, timelim_high)
 
         if res_high.runtime <= timelim_low:
             res_low = res_high
@@ -454,16 +497,187 @@ class TestCase(ProblemAspect):
         res_high.set_ac_runtime()
         return (res, res_low, res_high)
 
+    def _run_single_pass(self, sub, tc_args: list[str] | None, timelim_high: int) -> SubmissionResult:
+        """Run a non-interactive, non-multi-pass submission on this test case."""
+        outfile = os.path.join(self._problem.tmpdir, f'output-{self.counter}')
+        errfile = os.path.join(self._problem.tmpdir, f'error-{self.counter}')
+        status, runtime = sub.run(
+            infile=self.infile,
+            outfile=outfile,
+            errfile=errfile,
+            args=tc_args,
+            timelim=timelim_high + 1,
+            memlim=self._problem.metadata.limits.memory,
+            work_dir=sub.path,
+        )
+        if is_TLE(status) or runtime > timelim_high:
+            res = SubmissionResult('TLE')
+        elif is_RTE(status):
+            try:
+                with open(errfile, mode='rt') as f:
+                    info = f.read()
+            except IOError:
+                self.info('Failed to read error file %s', errfile)
+                info = None
+            res = SubmissionResult('RTE', additional_info=info)
+        else:
+            res = self._problem.output_validators.validate(self, outfile)
+        res.runtime = runtime
+        return res
+
+    def _run_multi_pass(self, sub, tc_args: list[str] | None, timelim_high: int) -> SubmissionResult:
+        """Run a multi-pass submission, looping through passes.
+
+        Per the 2025-09 spec:
+        - The submission is executed multiple times.
+        - After each pass, the output validator is invoked.
+        - If the validator exits with 42 and creates nextpass.in, another pass runs.
+        - Time/memory limits apply per invocation separately.
+        - Feedback directory persists between passes.
+        - It's a judge error if nextpass.in is created but exit code != 42.
+        - Max passes is validation_passes from problem.yaml.
+        """
+        max_passes = self._problem.metadata.limits.validation_passes
+        total_runtime = 0.0
+        feedbackdir = tempfile.mkdtemp(prefix='feedback_mp', dir=self._problem.tmpdir)
+        current_infile = self.infile
+
+        try:
+            for pass_num in range(1, max_passes + 1):
+                # Remove nextpass.in from previous pass (spec: "nextpass.in will be removed before the next pass")
+                nextpass_file = os.path.join(feedbackdir, 'nextpass.in')
+                if os.path.isfile(nextpass_file):
+                    os.unlink(nextpass_file)
+
+                outfile = os.path.join(self._problem.tmpdir, f'output-{self.counter}-pass{pass_num}')
+                errfile = os.path.join(self._problem.tmpdir, f'error-{self.counter}-pass{pass_num}')
+
+                status, runtime = sub.run(
+                    infile=current_infile,
+                    outfile=outfile,
+                    errfile=errfile,
+                    args=tc_args,
+                    timelim=timelim_high + 1,
+                    memlim=self._problem.metadata.limits.memory,
+                    work_dir=sub.path,
+                )
+                total_runtime = max(total_runtime, runtime)  # Per spec: limits apply per invocation
+
+                if is_TLE(status) or runtime > timelim_high:
+                    res = SubmissionResult('TLE')
+                    res.runtime = total_runtime
+                    return res
+                elif is_RTE(status):
+                    try:
+                        with open(errfile, mode='rt') as f:
+                            info = f.read()
+                    except IOError:
+                        self.info('Failed to read error file %s', errfile)
+                        info = None
+                    res = SubmissionResult('RTE', additional_info=info)
+                    res.runtime = total_runtime
+                    return res
+
+                # Validate this pass's output. Pass feedbackdir so it persists between passes.
+                res = self._problem.output_validators.validate(self, outfile, feedbackdir=feedbackdir)
+                res.runtime = total_runtime
+
+                nextpass_file = os.path.join(feedbackdir, 'nextpass.in')
+                has_nextpass = os.path.isfile(nextpass_file)
+
+                if res.verdict != 'AC':
+                    # Validator rejected: judging stops
+                    if has_nextpass:
+                        # Judge error: nextpass.in created but exit code was not 42 (WA = 43)
+                        return SubmissionResult(
+                            'JE',
+                            reason=f'Pass {pass_num}: nextpass.in created but validator did not accept (verdict: {res.verdict})',
+                        )
+                    return res
+
+                # Validator accepted (exit 42)
+                if not has_nextpass:
+                    # No more passes needed, submission is accepted
+                    return res
+
+                # More passes to come: use nextpass.in as input for next pass
+                # Copy to a stable temp file so the feedback dir can be cleaned per pass
+                next_infile = os.path.join(self._problem.tmpdir, f'nextpass-{self.counter}-pass{pass_num}.in')
+                shutil.copy2(nextpass_file, next_infile)
+                current_infile = next_infile
+
+            # Exceeded max passes: judge error
+            return SubmissionResult(
+                'JE',
+                reason=f'Multi-pass: exceeded maximum {max_passes} passes (still producing nextpass.in)',
+            )
+        finally:
+            shutil.rmtree(feedbackdir, ignore_errors=True)
+
     def _init_result_for_testcase(self, res: SubmissionResult) -> SubmissionResult:
         res = copy.copy(res)
         res.testcase = self
         res.runtime_testcase = self
+        if self._problem.format is FormatVersion.V_2025_09:
+            self._init_result_2025_09(res)
+        else:
+            self._init_result_legacy(res)
+        return res
+
+    def _init_result_legacy(self, res: SubmissionResult) -> None:
+        """Set score for legacy format using accept_score/reject_score."""
         if res.score is None:
             if res.verdict == 'AC':
                 res.score = self.testcasegroup.config['accept_score']
             else:
                 res.score = self.testcasegroup.config['reject_score']
-        return res
+
+    def _init_result_2025_09(self, res: SubmissionResult) -> None:
+        """Set score for 2025-09 format using score_aggregation logic."""
+        if not self._problem.is_scoring():
+            # Pass-fail: no scores
+            res.score = None
+            return
+
+        aggregation = self.testcasegroup.config.get('score_aggregation', 'pass-fail')
+        if aggregation == 'pass-fail':
+            # In pass-fail aggregation groups, individual test case scores aren't used
+            res.score = None
+            return
+
+        if res.verdict != 'AC':
+            res.score = 0.0
+            return
+
+        # For AC in sum/min groups: determine score
+        max_score_group = self.testcasegroup.config.get('max_score', 'unbounded')
+
+        if res.score is not None:
+            # Score was set by the validator (score.txt or score_multiplier.txt)
+            # If it came from score_multiplier.txt, it's a 0-1 multiplier and we need to multiply by per-case max
+            # For now, scores from validators are already computed correctly
+            return
+
+        # No score from validator
+        if max_score_group == 'unbounded':
+            # For unbounded max_score, validator MUST produce score.txt
+            # This will be caught as a JE elsewhere
+            res.score = 0.0
+            return
+
+        # Bounded max_score with no validator score: score = max per-case score
+        # Per-case max = (max_score - static_validation_score) / N
+        num_cases = len(self.testcasegroup.get_testcases())
+        static_score = self.testcasegroup.config.get('static_validation_score', 0)
+        if isinstance(static_score, str) and static_score == 'pass-fail':
+            static_score = 0  # pass-fail static validation doesn't reduce the score pool
+        if num_cases > 0:
+            per_case = (float(max_score_group) - float(static_score)) / num_cases
+            if aggregation == 'min':
+                per_case = float(max_score_group)  # For min, each case has max_score as its max
+            res.score = per_case
+        else:
+            res.score = 0.0
 
     def get_all_testcases(self) -> list[TestCase]:
         return [self]
@@ -474,8 +688,32 @@ class TestCase(ProblemAspect):
 
 class TestCaseGroup(ProblemAspect):
     name: str
-    _DEFAULT_CONFIG = config.load_config('testdata.yaml')
-    _SCORING_ONLY_KEYS = ['accept_score', 'reject_score', 'range']
+    _DEFAULT_CONFIG_LEGACY = config.load_config('testdata.yaml')
+    _DEFAULT_CONFIG_2025_09 = config.load_config('testdata_2025_09.yaml')
+    _SCORING_ONLY_KEYS_LEGACY = ['accept_score', 'reject_score', 'range']
+    # 2025-09 scoring keys that are not valid in sample groups
+    _SCORING_KEYS_2025_09 = ['max_score', 'score_aggregation', 'static_validation_score', 'require_pass']
+
+    def _find_config_file(self) -> str | None:
+        """Find the config file for this test data group (test_group.yaml for 2025-09, testdata.yaml for legacy)."""
+        new_config = os.path.join(self._datadir, 'test_group.yaml')
+        legacy_config = os.path.join(self._datadir, 'testdata.yaml')
+        has_new = os.path.isfile(new_config)
+        has_legacy = os.path.isfile(legacy_config)
+
+        if has_new and has_legacy:
+            self.error(f'Both test_group.yaml and testdata.yaml found in {self._datadir}. Only one is allowed.')
+            return new_config  # Prefer the new one
+
+        if self._problem.format is FormatVersion.LEGACY:
+            if has_new:
+                self.warning(f'Found test_group.yaml in {self._datadir}, but problem uses legacy format. Use testdata.yaml instead.')
+            return legacy_config if has_legacy else None
+        else:
+            if has_legacy:
+                self.warning(f'Found testdata.yaml in {self._datadir}, but problem uses format {self._problem.format}. Use test_group.yaml instead.')
+                return legacy_config  # Still use it, just warn
+            return new_config if has_new else None
 
     def __init__(self, problem: Problem, datadir: str | None = None, parent: TestCaseGroup | None = None):
         self._parent = parent
@@ -488,9 +726,9 @@ class TestCaseGroup(ProblemAspect):
 
         self._seen_oob_scores = False
         self.debug('Loading test data group %s', datadir)
-        configfile = os.path.join(self._datadir, 'testdata.yaml')
+        configfile = self._find_config_file()
         self.config: dict[str, Any] = {}
-        if os.path.isfile(configfile):
+        if configfile is not None and os.path.isfile(configfile):
             try:
                 with open(configfile) as f:
                     self.config = yaml.safe_load(f)
@@ -499,14 +737,46 @@ class TestCaseGroup(ProblemAspect):
             if self.config is None:
                 self.config = {}
 
+        # Substitute constants in test_group.yaml values (2025-09 only)
+        if problem.format is FormatVersion.V_2025_09 and self.config and problem.metadata.constants:
+            self.config, undef = statement_util.substitute_constants_in_yaml(self.config, problem.metadata.constants)
+            for ref in undef:
+                self.warning("Undefined constant '{{%s}}' in %s" % (ref, configfile))
+
         # For non-root groups, missing properties are inherited from the parent group
         if parent:
             for field, parent_value in parent.config.items():
                 if field not in self.config:
                     self.config[field] = parent_value
 
-        # TODO: Decide if these should stay
-        # Some deprecated properties are inherited from problem config during a transition period
+        # Apply version-specific defaults
+        if problem.format is FormatVersion.LEGACY:
+            self._apply_legacy_defaults(problem)
+        else:
+            self._apply_2025_09_defaults()
+
+        # Directories under data/ that are for validation testing, not for running submissions
+        _VALIDATION_DIRS = frozenset({'invalid_input', 'invalid_output', 'valid_output'})
+
+        self._items: list[TestCaseGroup | TestCase] = []
+        if os.path.isdir(datadir):
+            for filename in sorted(os.listdir(datadir)):
+                filepath = os.path.join(datadir, filename)
+                if os.path.isdir(filepath):
+                    # Skip validation directories at the root level - they're not test case groups
+                    if not parent and os.path.basename(filepath) in _VALIDATION_DIRS:
+                        continue
+                    self._items.append(TestCaseGroup(problem, filepath, self))
+                else:
+                    base, ext = os.path.splitext(filepath)
+                    if ext == '.ans' and os.path.isfile(f'{base}.in'):
+                        self._items.append(TestCase(problem, base, self))
+
+        if not parent:
+            self.set_symlinks()
+
+    def _apply_legacy_defaults(self, problem: Problem) -> None:
+        """Apply legacy testdata defaults and inherit from problem config."""
         legacy_grading = problem.metadata.legacy_grading
         for key in ['accept_score', 'reject_score', 'range']:
             if getattr(legacy_grading, key) is not None:
@@ -519,27 +789,79 @@ class TestCaseGroup(ProblemAspect):
             self.config['on_reject'] = 'continue'
 
         if self._problem.is_pass_fail():
-            for key in TestCaseGroup._SCORING_ONLY_KEYS:
+            for key in TestCaseGroup._SCORING_ONLY_KEYS_LEGACY:
                 if key not in self.config:
                     self.config[key] = None
 
-        for field, default in TestCaseGroup._DEFAULT_CONFIG.items():
+        for field, default in TestCaseGroup._DEFAULT_CONFIG_LEGACY.items():
             if field not in self.config:
                 self.config[field] = default
 
-        self._items: list[TestCaseGroup | TestCase] = []
-        if os.path.isdir(datadir):
-            for filename in sorted(os.listdir(datadir)):
-                filename = os.path.join(datadir, filename)
-                if os.path.isdir(filename):
-                    self._items.append(TestCaseGroup(problem, filename, self))
-                else:
-                    base, ext = os.path.splitext(filename)
-                    if ext == '.ans' and os.path.isfile(f'{base}.in'):
-                        self._items.append(TestCase(problem, base, self))
+    def _apply_2025_09_defaults(self) -> None:
+        """Apply 2025-09 test_group.yaml defaults."""
+        # Determine context-dependent defaults based on group name
+        basename = os.path.basename(self._datadir)
+        is_sample = basename == 'sample' or (self._parent is not None and 'sample' in self.name)
+        is_secret_root = basename == 'secret' and self._parent is not None and self._parent._parent is None
 
-        if not parent:
-            self.set_symlinks()
+        # max_score and score_aggregation have context-dependent defaults
+        if 'max_score' not in self.config:
+            if is_secret_root:
+                self.config['max_score'] = 100
+            else:
+                self.config['max_score'] = 'unbounded'
+
+        if 'score_aggregation' not in self.config:
+            if is_secret_root:
+                self.config['score_aggregation'] = 'sum'
+            else:
+                self.config['score_aggregation'] = 'pass-fail'
+
+        if 'full_feedback' not in self.config:
+            self.config['full_feedback'] = is_sample
+
+        if 'require_pass' not in self.config:
+            self.config['require_pass'] = []
+
+        for field, default in TestCaseGroup._DEFAULT_CONFIG_2025_09.items():
+            if field not in self.config:
+                self.config[field] = default
+
+        # Derive on_reject from score_aggregation for runtime compatibility
+        # pass-fail → break on first failure; sum/min → continue (run all cases)
+        if 'on_reject' not in self.config:
+            if self.config.get('score_aggregation') == 'pass-fail':
+                self.config['on_reject'] = 'break'
+            else:
+                self.config['on_reject'] = 'continue'
+
+        # Legacy grading key needed by grader code path
+        if 'grading' not in self.config:
+            self.config['grading'] = 'default'
+
+        # Bridge 2025-09 args to legacy flags format for runtime compatibility
+        # These are used by validators and other code that checks config['output_validator_flags'] etc.
+        if 'output_validator_flags' not in self.config:
+            args = self.config.get('output_validator_args', [])
+            self.config['output_validator_flags'] = ' '.join(args) if isinstance(args, list) else str(args)
+        if 'input_validator_flags' not in self.config:
+            args = self.config.get('input_validator_args', [])
+            if isinstance(args, list):
+                self.config['input_validator_flags'] = ' '.join(args)
+            elif isinstance(args, dict):
+                # Map format: join all values; the validators check this differently
+                self.config['input_validator_flags'] = ''
+            else:
+                self.config['input_validator_flags'] = str(args)
+        if 'grader_flags' not in self.config:
+            self.config['grader_flags'] = ''
+        # Bridge scoring defaults for runtime compatibility
+        if 'accept_score' not in self.config:
+            self.config['accept_score'] = 1.0
+        if 'reject_score' not in self.config:
+            self.config['reject_score'] = 0.0
+        if 'range' not in self.config:
+            self.config['range'] = '-inf +inf'
 
     def start_background_work(self, context: Context) -> None:
         pass
@@ -588,6 +910,25 @@ class TestCaseGroup(ProblemAspect):
             return self._check_res
         self._check_res = True
 
+        if self._problem.format is FormatVersion.LEGACY:
+            self._check_legacy(context)
+        else:
+            self._check_2025_09(context)
+
+        # Common checks for both formats
+        self._check_files_and_ordering(context)
+        if self._parent is None:
+            self._check_top_level()
+
+        # Recursively check children
+        for child in self._items:
+            if child.matches_filter(context.data_filter):
+                child.check(context)
+
+        return self._check_res
+
+    def _check_legacy(self, context: Context) -> None:
+        """Legacy-format specific testdata validation."""
         if self.config['grading'] not in ['default', 'custom']:
             self.error('Invalid grading policy in testdata.yaml')
 
@@ -605,11 +946,11 @@ class TestCaseGroup(ProblemAspect):
                 )
 
         for field in self.config.keys():
-            if field not in TestCaseGroup._DEFAULT_CONFIG.keys():
+            if field not in TestCaseGroup._DEFAULT_CONFIG_LEGACY.keys():
                 self.warning(f"Unknown key '{field}' in '{os.path.join(self._datadir, 'testdata.yaml')}'")
 
         if not self._problem.is_scoring():
-            for key in TestCaseGroup._SCORING_ONLY_KEYS:
+            for key in TestCaseGroup._SCORING_ONLY_KEYS_LEGACY:
                 if self.config.get(key) is not None:
                     self.error(f"Key '{key}' is only applicable for scoring problems, this is a pass-fail problem")
 
@@ -628,41 +969,156 @@ class TestCaseGroup(ProblemAspect):
             except Exception:
                 self.error(f"Invalid format '{score_range}' for range: must be exactly two floats")
 
-        if self._parent is None:
-            seen_secret = False
-            seen_sample = False
-            for item in self._items:
-                if not isinstance(item, TestCaseGroup):
-                    self.error("Can't have individual test data files at top level")
+    def _check_2025_09(self, context: Context) -> None:
+        """2025-09 format specific test_group.yaml validation."""
+        basename = os.path.basename(self._datadir)
+        is_sample = basename == 'sample' or (self._parent is not None and 'sample' in self.name)
+
+        # Validate known keys
+        known_keys = set(TestCaseGroup._DEFAULT_CONFIG_2025_09.keys()) | set(TestCaseGroup._SCORING_KEYS_2025_09)
+        # Also allow legacy-derived keys that we compute internally
+        known_keys |= {'on_reject', 'grading', 'accept_score', 'reject_score', 'range',
+                        'grader_flags', 'input_validator_flags', 'output_validator_flags'}
+        for field in self.config.keys():
+            if field not in known_keys:
+                self.warning(f"Unknown key '{field}' in '{os.path.join(self._datadir, 'test_group.yaml')}'")
+
+        # Validate score_aggregation value
+        if self.config.get('score_aggregation') not in ['pass-fail', 'sum', 'min', None]:
+            self.error(f"Invalid value '{self.config.get('score_aggregation')}' for score_aggregation (must be 'pass-fail', 'sum', or 'min')")
+
+        # Scoring keys not permitted in sample
+        if is_sample:
+            _SAMPLE_FORBIDDEN_KEYS = {'max_score', 'score_aggregation', 'require_pass', 'static_validation_score'}
+            configfile = os.path.join(self._datadir, 'test_group.yaml')
+            if os.path.isfile(configfile):
+                try:
+                    with open(configfile) as f:
+                        raw_config = yaml.safe_load(f) or {}
+                except Exception:
+                    raw_config = {}
+                for key in _SAMPLE_FORBIDDEN_KEYS:
+                    if key in raw_config:
+                        self.error(f"Key '{key}' is not permitted in sample test_group.yaml")
+
+        # Pass-fail problems must not use scoring keys
+        if not self._problem.is_scoring():
+            configfile = os.path.join(self._datadir, 'test_group.yaml')
+            if os.path.isfile(configfile):
+                try:
+                    with open(configfile) as f:
+                        raw_config = yaml.safe_load(f) or {}
+                except Exception:
+                    raw_config = {}
+                for key in ('max_score', 'score_aggregation', 'require_pass'):
+                    if key in raw_config:
+                        self.error(f"Key '{key}' is for scoring problems only, but this is a pass-fail problem")
+
+        # Validate max_score value
+        max_score = self.config.get('max_score')
+        if max_score is not None and max_score != 'unbounded':
+            if not isinstance(max_score, int) or max_score < 0:
+                self.error(f"Invalid value '{max_score}' for max_score (must be a non-negative integer or 'unbounded')")
+
+        # Validate max_score consistency: groups may only be unbounded if secret is unbounded
+        if max_score == 'unbounded' and self._parent is not None:
+            # Walk up to find the secret root's max_score
+            parent = self._parent
+            while parent._parent is not None:
+                parent = parent._parent
+            secret_group = parent.get_subgroup('secret')
+            if secret_group and secret_group.config.get('max_score') != 'unbounded':
+                self.error("Test data group has unbounded max_score but 'secret' has bounded max_score")
+
+        # Validate require_pass contains valid group references
+        require_pass = self.config.get('require_pass', [])
+        if isinstance(require_pass, str):
+            require_pass = [require_pass]
+            self.config['require_pass'] = require_pass
+
+        # Validate static_validation_score
+        static_val_score = self.config.get('static_validation_score')
+        if static_val_score is not None:
+            if not hasattr(self._problem, 'static_validator') or not self._problem.static_validator.has_static_validator():
+                self.error("static_validation_score specified but no static_validator/ directory found")
+            if static_val_score == 'pass-fail':
+                aggregation = self.config.get('score_aggregation', 'pass-fail')
+                if aggregation != 'pass-fail' and self._problem.is_scoring():
+                    self.error("static_validation_score: 'pass-fail' requires score_aggregation to be 'pass-fail'")
+            elif isinstance(static_val_score, int):
+                if static_val_score < 0:
+                    self.error(f"static_validation_score must be non-negative, got {static_val_score}")
+                if not self._problem.is_scoring():
+                    self.error("static_validation_score (as integer) is only for scoring problems")
+            else:
+                self.error(f"Invalid static_validation_score value: {static_val_score} (must be non-negative int or 'pass-fail')")
+
+            # Cannot use static_validator_args without static_validation_score
+            # (already validated by having static_validation_score)
+
+        # Validate static_validator_args without static_validation_score
+        if self.config.get('static_validator_args') and static_val_score is None:
+            self.error("static_validator_args specified without static_validation_score")
+
+        for ref in require_pass:
+            if ref == 'sample':
+                continue  # 'sample' is always valid
+            # Validate that referenced groups exist and use pass-fail aggregation
+            # Referenced groups must be sibling groups that come lexicographically earlier
+            if self._parent is not None:
+                ref_group = self._parent.get_subgroup(ref)
+                if ref_group is None:
+                    self.error(f"require_pass references group '{ref}' which does not exist")
+                elif ref_group.config.get('score_aggregation', 'pass-fail') != 'pass-fail':
+                    self.error(f"require_pass references group '{ref}' which does not use pass-fail aggregation")
+                elif os.path.basename(ref_group._datadir) >= basename:
+                    self.warning(f"require_pass references group '{ref}' which is not lexicographically earlier than '{basename}'")
+
+    def _check_top_level(self) -> None:
+        """Check top-level data directory structure."""
+        seen_secret = False
+        seen_sample = False
+        _VALIDATION_DIRS = frozenset({'invalid_input', 'invalid_output', 'valid_output'})
+        for item in self._items:
+            if not isinstance(item, TestCaseGroup):
+                self.error("Can't have individual test data files at top level")
+            else:
+                name = os.path.basename(item._datadir)
+                if name == 'secret':
+                    seen_secret = True
+                elif name == 'sample':
+                    seen_sample = True
+                elif name in _VALIDATION_DIRS:
+                    if self._problem.format is FormatVersion.LEGACY:
+                        self.error(f'Validation directory "{name}" is not allowed in legacy format')
                 else:
-                    name = os.path.basename(item._datadir)
-                    if name == 'secret':
-                        seen_secret = True
-                    elif name == 'sample':
-                        seen_sample = True
-                    else:
+                    if self._problem.format is FormatVersion.LEGACY:
                         self.error('Test data at top level can only have the groups sample and secret')
-                        self.debug(str(self._items))
-            if not seen_secret:
-                self.error('No secret data provided')
-            if not seen_sample:
-                self.warning('No sample data provided')
+                    else:
+                        self.error(f'Test data at top level has unknown group "{name}"; expected sample, secret, invalid_input, invalid_output, or valid_output')
+                    self.debug(str(self._items))
+        if not seen_secret:
+            self.error('No secret data provided')
+        if not seen_sample:
+            self.warning('No sample data provided')
 
-            hashes = collections.defaultdict(list)
-            for root, dirs, files in os.walk(self._datadir):
-                for filename in files:
-                    filepath = os.path.join(root, filename)
-                    if filepath.endswith('.in') and not os.path.islink(filepath):
-                        md5 = hashlib.md5()
-                        with open(filepath, 'rb') as f:
-                            for buf in iter(lambda: f.read(1024), b''):
-                                md5.update(buf)
-                        filehash = md5.digest()
-                        hashes[filehash].append(os.path.relpath(filepath, self._problem.probdir))
-            for _, files in hashes.items():
-                if len(files) > 1:
-                    self.warning(f"Identical input files: '{str(files)}'")
+        hashes = collections.defaultdict(list)
+        for root, dirs, files in os.walk(self._datadir):
+            for filename in files:
+                filepath = os.path.join(root, filename)
+                if filepath.endswith('.in') and not os.path.islink(filepath):
+                    md5 = hashlib.md5()
+                    with open(filepath, 'rb') as f:
+                        for buf in iter(lambda: f.read(1024), b''):
+                            md5.update(buf)
+                    filehash = md5.digest()
+                    hashes[filehash].append(os.path.relpath(filepath, self._problem.probdir))
+        for _, files in hashes.items():
+            if len(files) > 1:
+                self.warning(f"Identical input files: '{str(files)}'")
 
+    def _check_files_and_ordering(self, context: Context) -> None:
+        """Check input/answer file pairs and group ordering."""
         infiles = glob.glob(os.path.join(self._datadir, '*.in'))
         ansfiles = glob.glob(os.path.join(self._datadir, '*.ans'))
 
@@ -676,6 +1132,38 @@ class TestCaseGroup(ProblemAspect):
                 continue
             if f'{ansfile[:-4]}.in' not in infiles:
                 self.error(f"No matching input file for answer '{ansfile}'")
+
+        # 2025-09: Validate .out files (display override - must pass output validation)
+        if self._problem.format is FormatVersion.V_2025_09:
+            outfiles = glob.glob(os.path.join(self._datadir, '*.out'))
+            for outfile in outfiles:
+                if os.path.isdir(outfile):
+                    continue
+                base = outfile[:-4]
+                if f'{base}.in' not in infiles:
+                    self.error(f"No matching input file for .out file '{outfile}'")
+                if f'{base}.ans' not in ansfiles:
+                    self.error(f"No matching answer file for .out file '{outfile}'")
+
+            # Validate .files directories
+            for entry in os.scandir(self._datadir):
+                if entry.is_dir() and entry.name.endswith('.files'):
+                    base = os.path.join(self._datadir, entry.name[:-6])
+                    if f'{base}.in' not in infiles:
+                        self.error(f"No matching input file for .files directory '{entry.name}'")
+
+            # Check .in.statement, .ans.statement, .in.download, .ans.download files
+            for ext_pair in [('.in.statement', '.in'), ('.ans.statement', '.ans'),
+                             ('.in.download', '.in'), ('.ans.download', '.ans')]:
+                pattern = os.path.join(self._datadir, f'*{ext_pair[0]}')
+                for override_file in glob.glob(pattern):
+                    if os.path.isdir(override_file):
+                        continue
+                    # Derive base name
+                    base_name = override_file[:-(len(ext_pair[0]))]
+                    expected_file = f'{base_name}{ext_pair[1]}'
+                    if not os.path.isfile(expected_file):
+                        self.error(f"No matching '{ext_pair[1]}' file for override '{os.path.basename(override_file)}'")
 
         if not self.get_subgroups() and not self.get_testcases():
             if os.path.basename(self._datadir) != 'sample':
@@ -722,14 +1210,28 @@ class TestCaseGroup(ProblemAspect):
                 self.warning(f"Test data group '{last_testgroup_name}' will be ordered before '{name}'; consider zero-padding")
             last_testgroup_name = name
 
-        for child in self._items:
-            if child.matches_filter(context.data_filter):
-                child.check(context)
-
-        return self._check_res
-
     def run_submission(self, sub, runner: Runner, context: Context) -> TestCase.Result:
         self.info(f'Running on {self}')
+
+        # For 2025-09: check require_pass dependencies
+        if self._problem.format is FormatVersion.V_2025_09:
+            require_pass = self.config.get('require_pass', [])
+            if isinstance(require_pass, str):
+                require_pass = [require_pass]
+            for dep_name in require_pass:
+                dep_result = self._problem._group_results.get(dep_name)
+                if dep_result is None:
+                    self.debug(f'require_pass: dependency "{dep_name}" has no result yet, skipping group')
+                    skip_res = SubmissionResult('AC')
+                    skip_res.score = 0.0
+                    skip_res.verdict = 'AC'  # Not accepted but scored 0
+                    return (skip_res, skip_res, skip_res)
+                if dep_result.verdict != 'AC':
+                    self.info(f'require_pass: dependency "{dep_name}" did not pass (verdict: {dep_result.verdict}), skipping group')
+                    skip_res = SubmissionResult('AC')
+                    skip_res.score = 0.0
+                    return (skip_res, skip_res, skip_res)
+
         subres: list[SubmissionResult] = []
         subres_low: list[SubmissionResult] = []
         subres_high: list[SubmissionResult] = []
@@ -754,11 +1256,16 @@ class TestCaseGroup(ProblemAspect):
 
         runner.mark_group_done(self, broken)
 
-        return (
-            self.aggregate_results(sub, subres),
-            self.aggregate_results(sub, subres_low, shadow_result=True),
-            self.aggregate_results(sub, subres_high, shadow_result=True),
-        )
+        result = self.aggregate_results(sub, subres)
+        result_low = self.aggregate_results(sub, subres_low, shadow_result=True)
+        result_high = self.aggregate_results(sub, subres_high, shadow_result=True)
+
+        # For 2025-09: store group result for require_pass checking by later groups
+        if self._problem.format is FormatVersion.V_2025_09 and self._parent is not None:
+            group_name = os.path.basename(self._datadir)
+            self._problem._group_results[group_name] = result
+
+        return (result, result_low, result_high)
 
     def aggregate_results(self, sub, sub_results: list[SubmissionResult], shadow_result: bool = False) -> SubmissionResult:
         res = SubmissionResult('JE')
@@ -778,6 +1285,21 @@ class TestCaseGroup(ProblemAspect):
             res.reason = judge_error.reason
             res.additional_info = judge_error.additional_info
             res.testcase = judge_error.testcase
+        elif self._problem.format is FormatVersion.V_2025_09:
+            res.verdict, score = self._aggregate_2025_09(sub_results, shadow_result)
+            if sub_results:
+                res.testcase = sub_results[-1].testcase
+                res.additional_info = sub_results[-1].additional_info
+            if self._problem.is_scoring():
+                res.score = score
+                max_score = self.config.get('max_score')
+                if max_score is not None and max_score != 'unbounded':
+                    if score is not None and score > max_score and not self._seen_oob_scores:
+                        self._seen_oob_scores = True
+                        groupname = os.path.relpath(self._datadir, self._problem.probdir)
+                        self.error(
+                            f'submission {sub} got score {score} on group {groupname}, which exceeds max_score {max_score}'
+                        )
         else:
             res.verdict, score = self._problem.graders.grade(sub_results, self, shadow_result)
             if sub_results:
@@ -787,14 +1309,86 @@ class TestCaseGroup(ProblemAspect):
                 res.score = score
                 min_score, max_score = self.get_score_range()
                 if score is not None and not (min_score <= score <= max_score) and not self._seen_oob_scores:
-                    # Don't warn twice on the same subgroup, since every submission is likely
-                    # to have the same error.
                     self._seen_oob_scores = True
                     groupname = os.path.relpath(self._datadir, self._problem.probdir)
                     self.error(
                         f'submission {sub} got {res} on group {groupname}, which is outside of expected score range [{min_score}, {max_score}]'
                     )
         return res
+
+    def _aggregate_2025_09(self, sub_results: list[SubmissionResult], shadow_result: bool = False) -> tuple[Verdict, float | None]:
+        """Aggregate results using 2025-09 score_aggregation logic."""
+        aggregation = self.config.get('score_aggregation', 'pass-fail')
+
+        if not sub_results:
+            if not shadow_result:
+                self.info(f'No results on {self}')
+            if aggregation == 'pass-fail':
+                return ('AC', self._get_max_score_value())
+            return ('AC', 0.0)
+
+        # Check if all accepted
+        all_ac = all(r.verdict == 'AC' for r in sub_results)
+
+        if not self._problem.is_scoring():
+            # Pass-fail problem: simple AC/non-AC
+            if all_ac:
+                return ('AC', None)
+            # Return the first non-AC verdict
+            first_fail = next(r for r in sub_results if r.verdict != 'AC')
+            return (first_fail.verdict, None)
+
+        # Scoring problem
+        if aggregation == 'pass-fail':
+            max_score = self._get_max_score_value()
+            if all_ac:
+                return ('AC', max_score)
+            first_fail = next(r for r in sub_results if r.verdict != 'AC')
+            return (first_fail.verdict, 0.0)
+
+        elif aggregation == 'sum':
+            scores = [r.score if r.score is not None else 0.0 for r in sub_results]
+            total = sum(scores)
+            if all_ac:
+                verdict: Verdict = 'AC'
+            else:
+                # Report the "worst" non-AC verdict
+                verdict = self._worst_verdict(sub_results)
+            if not shadow_result:
+                self.debug(f'Sum aggregation on {self}: {total} (from {scores})')
+            return (verdict, total)
+
+        elif aggregation == 'min':
+            scores = [r.score if r.score is not None else 0.0 for r in sub_results]
+            min_score = min(scores)
+            if all_ac:
+                verdict = 'AC'
+            else:
+                verdict = self._worst_verdict(sub_results)
+            if not shadow_result:
+                self.debug(f'Min aggregation on {self}: {min_score} (from {scores})')
+            return (verdict, min_score)
+
+        else:
+            self.error(f"Unknown score_aggregation '{aggregation}'")
+            return ('JE', None)
+
+    def _get_max_score_value(self) -> float:
+        """Get the numeric max_score value, returning 0.0 if unbounded."""
+        max_score = self.config.get('max_score')
+        if max_score is None or max_score == 'unbounded':
+            return 0.0
+        return float(max_score)
+
+    @staticmethod
+    def _worst_verdict(sub_results: list[SubmissionResult]) -> Verdict:
+        """Return the 'worst' non-AC verdict from a list of results."""
+        priority: dict[str, int] = {'JE': 0, 'WA': 1, 'RTE': 2, 'TLE': 3, 'AC': 4}
+        worst: Verdict = 'AC'
+        for r in sub_results:
+            if priority.get(r.verdict, 0) < priority.get(worst, 4):
+                worst = r.verdict  # type: ignore
+        return worst
 
     def all_datasets(self) -> list:
         res: list = []
@@ -820,14 +1414,18 @@ class ProblemStatement(ProblemPart):
 
         for ifilename in glob.glob(os.path.join(self.problem.probdir, 'data/sample/*.interaction')):
             if not self.problem.is_interactive() and not self.problem.is_multi_pass():
-                self.error(f'Problem is not interactive, but there is an interaction sample {ifilename}')
+                self.error(f'Problem is not interactive or multi-pass, but there is an interaction sample {ifilename}')
             with open(ifilename, 'r') as interaction:
                 for i, line in enumerate(interaction):
-                    valid_new_pass = self.problem.is_multi_pass() and line.strip() == '---'
-                    if len(line) == 0 or (line[0] != '<' and line[0] != '>' and not valid_new_pass):
-                        self.error(
-                            f'Interaction {ifilename}: line {i + 1} does not start with < or > {"or ---" if self.problem.is_multi_pass() else ""}'
-                        )
+                    if len(line) == 0:
+                        continue
+                    if line.rstrip() == '---':
+                        # Multi-pass pass separator
+                        if not self.problem.is_multi_pass():
+                            self.error(f'Interaction {ifilename}: line {i + 1} has --- separator but problem is not multi-pass')
+                        continue
+                    if line[0] != '<' and line[0] != '>':
+                        self.error(f'Interaction {ifilename}: line {i + 1} does not start with < or >')
                         break
 
         if not self.statements:
@@ -923,8 +1521,16 @@ class ProblemConfig(ProblemPart):
             if t1 in self._metadata.type and t2 in self._metadata.type:
                 self.error(f'Problem has incompatible types: {t1}, {t2}')
 
+        if self.problem.is_multi_pass():
+            if self._metadata.limits.validation_passes < 2:
+                self.error(f'Multi-pass problem must have validation_passes >= 2 (got {self._metadata.limits.validation_passes})')
+        else:
+            if 'validation_passes' in self._origdata.get('limits', {}):
+                self.warning('validation_passes is specified but problem is not multi-pass')
+
         if self.problem.is_submit_answer():
-            self.warning('The type submit-answer is not yet supported.')
+            self.warning('The type submit-answer is not yet fully supported. '
+                         'Example submissions are verified as programs, not as answer files.')
 
         # Check rights_owner
         if self._metadata.license == metadata.License.PUBLIC_DOMAIN:
@@ -946,7 +1552,7 @@ class ProblemConfig(ProblemPart):
             self.warning("License is 'unknown'")
 
         if self._metadata.uuid is None:
-            self.error_in_2023_07(f'Missing uuid from problem.yaml. Add "uuid: {uuid.uuid4()}" to problem.yaml.')
+            self.error_in_2025_09(f'Missing uuid from problem.yaml. Add "uuid: {uuid.uuid4()}" to problem.yaml.')
 
         names_with_no_statement = [lang for lang in self._metadata.name if lang not in self.problem.statement.statements]
         if names_with_no_statement:
@@ -998,6 +1604,29 @@ class ProblemConfig(ProblemPart):
                 'Time resolution is not an integer. This can be fragile, and may not be supported by your CCS (Kattis does not).'
             )
 
+        # Validate constant names and values
+        constant_name_re = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+        for name, value in self._metadata.constants.items():
+            if not constant_name_re.match(name):
+                self.error(f"Invalid constant name '{name}' (must match [a-zA-Z_][a-zA-Z0-9_]*)")
+            if isinstance(value, dict):
+                if 'value' not in value:
+                    self.error(f"Constant '{name}' is a map but missing required 'value' key")
+                else:
+                    # Validate variant keys and check if variants appear to differ from 'value'
+                    main_value = value['value']
+                    for variant_key, variant_value in value.items():
+                        if variant_key == 'value':
+                            continue
+                        if not constant_name_re.match(variant_key):
+                            self.error(f"Invalid variant key '{variant_key}' for constant '{name}' (must match [a-zA-Z_][a-zA-Z0-9_]*)")
+                        # Best-effort heuristic: warn if numeric values differ
+                        try:
+                            if float(main_value) != float(variant_value):
+                                pass  # Variants are expected to differ in representation
+                        except (ValueError, TypeError):
+                            pass
+
         return self._check_res
 
 
@@ -1012,6 +1641,9 @@ class Attachments(ProblemPart):
 
     PART_NAME = 'attachments'
 
+    # Directories allowed inside attachments/ (2025-09)
+    _ALLOWED_ATTACHMENT_DIRS = frozenset({'templates'})
+
     def setup(self):
         attachments_dir = Path(self.problem.probdir) / 'attachments'
         self.attachments = [p for p in attachments_dir.iterdir()] if attachments_dir.is_dir() else []
@@ -1022,11 +1654,81 @@ class Attachments(ProblemPart):
             return self._check_res
         self._check_res = True
 
+        if self.problem.format is FormatVersion.V_2025_09:
+            self._check_2025_09()
+        else:
+            self._check_legacy()
+
+        # Check solution/ directory
+        solution_dir = Path(self.problem.probdir) / 'solution'
+        if solution_dir.is_dir():
+            if self.problem.format is FormatVersion.LEGACY:
+                self.warning("'solution/' directory is only supported in 2025-09 format")
+            else:
+                self._check_solution_dir(solution_dir)
+
+        # Check generators/ directory (informational only, just accept it)
+        generators_dir = Path(self.problem.probdir) / 'generators'
+        if generators_dir.is_dir():
+            if self.problem.format is FormatVersion.LEGACY:
+                self.warning("'generators/' directory is only supported in 2025-09 format")
+            else:
+                self.debug("Found generators/ directory (informational only)")
+
+        # Check include/ directory
+        include_dir = Path(self.problem.probdir) / 'include'
+        if include_dir.is_dir():
+            self._check_include_dir(include_dir)
+
+        return self._check_res
+
+    def _check_legacy(self):
+        """Legacy format: directories not allowed as attachments."""
         for attachment_path in self.attachments:
             if os.path.isdir(attachment_path):
                 self.error(f'Directories are not allowed as attachments ({attachment_path} is a directory)')
 
-        return self._check_res
+    def _check_2025_09(self):
+        """2025-09 format: only known subdirectories allowed in attachments/."""
+        for attachment_path in self.attachments:
+            if attachment_path.is_dir():
+                if attachment_path.name not in self._ALLOWED_ATTACHMENT_DIRS:
+                    self.error(f"Unknown directory '{attachment_path.name}' in attachments/ (allowed: {', '.join(sorted(self._ALLOWED_ATTACHMENT_DIRS))})")
+        # Validate templates/ if present
+        templates_dir = Path(self.problem.probdir) / 'attachments' / 'templates'
+        if templates_dir.is_dir():
+            self._check_templates_dir(templates_dir)
+
+    def _check_templates_dir(self, templates_dir: Path):
+        """Validate attachments/templates/ directory structure."""
+        for entry in templates_dir.iterdir():
+            if entry.is_dir():
+                if not any(entry.iterdir()):
+                    self.error(f"Template directory '{entry.name}' is empty")
+            else:
+                self.warning(f"Unexpected file '{entry.name}' in attachments/templates/ (expected language directories)")
+
+    def _check_solution_dir(self, solution_dir: Path):
+        """Validate solution/ directory for 2025-09 format."""
+        solution_pattern = re.compile(r'^solution(\.[a-z]{2})?\.(?:tex|md|pdf)$')
+        has_solution_file = False
+        for entry in solution_dir.iterdir():
+            if entry.is_file() and solution_pattern.match(entry.name):
+                has_solution_file = True
+        if not has_solution_file:
+            self.warning("solution/ directory exists but contains no solution.<language>.<filetype> files")
+
+    def _check_include_dir(self, include_dir: Path):
+        """Validate include/ directory structure.
+
+        Each subdirectory must be named 'default' or a language code, and must be non-empty.
+        """
+        for entry in include_dir.iterdir():
+            if entry.is_dir():
+                if not any(entry.iterdir()):
+                    self.error(f"Include directory '{entry.name}' is empty (must be non-empty)")
+            else:
+                self.warning(f"Unexpected file '{entry.name}' directly in include/ (expected language directories)")
 
     def get_attachment_paths(self):
         return self.attachments
@@ -1091,6 +1793,23 @@ _JUNK_MODIFICATIONS = [
     ),
 ]
 
+# 2025-09 spec: validators/visualizers without build/run must be Python 3, C, or C++
+_ALLOWED_VALIDATOR_LANG_IDS = frozenset({'python3', 'c', 'cpp'})
+
+
+def _check_validator_language(part: ProblemPart, program, label: str) -> None:
+    """Warn if a validator program uses a language not allowed in 2025-09.
+
+    Only applies to SourceCode programs (BuildRun, Viva, Checktestdata are exempt).
+    """
+    if part.problem.format is not FormatVersion.V_2025_09:
+        return
+    if isinstance(program, run.SourceCode) and program.language.lang_id not in _ALLOWED_VALIDATOR_LANG_IDS:
+        part.warning(
+            '%s %s uses language %s; 2025-09 requires Python 3, C, or C++ for programs without build/run'
+            % (label, program.name, program.language.name)
+        )
+
 
 class InputValidators(ProblemPart):
     PART_NAME = 'input_validator'
@@ -1110,6 +1829,13 @@ class InputValidators(ProblemPart):
             allow_validation_script=True,
             work_dir=self.problem.tmpdir,
         )
+        # Substitute constants in validator source files (2025-09 only)
+        if self.problem.format is FormatVersion.V_2025_09 and self.problem.metadata.constants:
+            for val in self._validators:
+                if hasattr(val, 'path') and os.path.isdir(val.path):
+                    undef = statement_util.substitute_constants_in_directory(val.path, self.problem.metadata.constants)
+                    for ref in undef:
+                        self.warning("Undefined constant '{{%s}}' in input validator %s" % (ref, val))
         return {}
 
     def __str__(self) -> str:
@@ -1129,6 +1855,7 @@ class InputValidators(ProblemPart):
             self.error('No input format validators found')
 
         for val in self._validators[:]:
+            _check_validator_language(self, val, 'Input validator')
             try:
                 success, msg = val.compile()
                 if not success:
@@ -1242,9 +1969,14 @@ class Graders(ProblemPart):
             return self._check_res
         self._check_res = True
 
-        if self._grader:
-            if self.problem.is_pass_fail() and self._grader:
-                self.fatal('There is a grader but the problem is pass-fail')
+        # In 2025-09, graders/ directory is not allowed - scoring is done via score_aggregation
+        if self.problem.format is FormatVersion.V_2025_09:
+            if len(self._graders) > 0:
+                self.error('The graders/ directory is not allowed in 2025-09 format. Use score_aggregation in test_group.yaml instead.')
+            return self._check_res
+
+        if self.problem.is_pass_fail() and len(self._graders) > 0:
+            self.error('There are grader programs but the problem is pass-fail')
 
             success, msg = self._grader.compile()
             if not success:
@@ -1352,6 +2084,13 @@ class OutputValidators(ProblemPart):
             work_dir=self.problem.tmpdir,
         )
         self._has_precompiled = False
+        # Substitute constants in validator source files (2025-09 only)
+        if self.problem.format is FormatVersion.V_2025_09 and self.problem.metadata.constants:
+            for val in self._validators:
+                if hasattr(val, 'path') and os.path.isdir(val.path):
+                    undef = statement_util.substitute_constants_in_directory(val.path, self.problem.metadata.constants)
+                    for ref in undef:
+                        self.warning("Undefined constant '{{%s}}' in output validator %s" % (ref, val))
 
     def uses_default_validator(self) -> bool:
         if self.problem.format is FormatVersion.LEGACY:
@@ -1374,16 +2113,14 @@ class OutputValidators(ProblemPart):
 
         self.warn_directory('output validators', 'output_validator_directory')
 
-        safe_output_validator_languages = {'c', 'cpp', 'python3'}
-
         for v in self._validators:
-            if isinstance(v, run.SourceCode) and v.language.lang_id not in safe_output_validator_languages:
-                self.error_in_2023_07(
-                    f'Output validator in {v.language.name}. Only {safe_output_validator_languages} are standardized. Check carefully if your CCS supports more (Kattis does not).'
+            if isinstance(v, run.SourceCode) and v.language.lang_id not in _ALLOWED_VALIDATOR_LANG_IDS:
+                self.error_in_2025_09(
+                    f'Output validator in {v.language.name}. Only Python 3, C, C++ are standardized for programs without build/run.'
                 )
 
         if len(self._validators) > 1:
-            self.error_in_2023_07('Found more than one output validator. This was allowed in legacy (but not on Kattis)')
+            self.error_in_2025_09('Found more than one output validator. This was allowed in legacy (but not on Kattis)')
 
         if self.uses_default_validator() and self._validators:
             self.error('There are validator programs but problem.yaml has validation = "default"')
@@ -1459,14 +2196,8 @@ class OutputValidators(ProblemPart):
             return '\n'.join(all_feedback)
         return None
 
-    def _parse_validator_results(self, val, status: int, feedbackdir, testcase: TestCase) -> SubmissionResult:
+    def _parse_validator_results(self, val, status: int, feedbackdir, testcase) -> SubmissionResult:
         score = None
-        # TODO: would be good to have some way of displaying the feedback for debugging uses
-        score_file = os.path.join(feedbackdir, 'score.txt')
-        if not self.problem.metadata.is_custom_score_allowed() and os.path.isfile(score_file):
-            return SubmissionResult(
-                'JE', reason='validator produced "score.txt" but problem does not have custom scoring activated'
-            )
 
         if not os.WIFEXITED(status):
             return SubmissionResult(
@@ -1485,8 +2216,29 @@ class OutputValidators(ProblemPart):
         if ret == 43:
             return SubmissionResult('WA', additional_info=OutputValidators._get_feedback(feedbackdir))
 
-        if self.problem.metadata.is_custom_score_mandatory():
-            if os.path.isfile(score_file):
+        # ret == 42 means AC. Now handle scoring.
+        score_file = os.path.join(feedbackdir, 'score.txt')
+        score_multiplier_file = os.path.join(feedbackdir, 'score_multiplier.txt')
+        has_score = os.path.isfile(score_file)
+        has_multiplier = os.path.isfile(score_multiplier_file)
+
+        if self.problem.format is FormatVersion.V_2025_09:
+            return self._parse_score_2025_09(has_score, has_multiplier, score_file, score_multiplier_file, feedbackdir, testcase)
+        else:
+            return self._parse_score_legacy(has_score, score_file, feedbackdir)
+
+    def _parse_score_legacy(self, has_score: bool, score_file: str, feedbackdir: str) -> SubmissionResult:
+        """Parse score for legacy format."""
+        custom_score = self.problem.metadata.legacy_custom_score
+        score = None
+
+        if not custom_score and has_score:
+            return SubmissionResult(
+                'JE', reason='validator produced "score.txt" but problem does not have custom scoring activated'
+            )
+
+        if custom_score:
+            if has_score:
                 try:
                     score_str = open(score_file).read()
                     score = float(score_str)
@@ -1503,20 +2255,62 @@ class OutputValidators(ProblemPart):
 
         return SubmissionResult('AC', score=score)
 
+    def _parse_score_2025_09(self, has_score: bool, has_multiplier: bool, score_file: str,
+                              score_multiplier_file: str, feedbackdir: str, testcase) -> SubmissionResult:
+        """Parse score for 2025-09 format, supporting score.txt and score_multiplier.txt."""
+        score = None
+
+        if has_score and has_multiplier:
+            return SubmissionResult(
+                'JE', reason='validator produced both "score.txt" and "score_multiplier.txt" (only one is allowed)'
+            )
+
+        if not self.problem.is_scoring():
+            # Pass-fail problem: score files are not expected
+            if has_score or has_multiplier:
+                # Not a judge error, just ignored for sample test cases on scoring problems.
+                # For pass-fail, it IS an error.
+                return SubmissionResult(
+                    'JE', reason='validator produced score file but problem is not a scoring problem'
+                )
+            return SubmissionResult('AC')
+
+        # Scoring problem with AC verdict
+        if has_score:
+            try:
+                score_str = open(score_file).read().strip()
+                score = float(score_str)
+            except Exception as e:
+                return SubmissionResult('JE', reason=f'failed to parse score.txt: {e}',
+                                       additional_info=OutputValidators._get_feedback(feedbackdir))
+            if score < 0:
+                return SubmissionResult('JE', reason=f'score.txt contains negative value: {score}')
+
+        elif has_multiplier:
+            try:
+                mult_str = open(score_multiplier_file).read().strip()
+                multiplier = float(mult_str)
+            except Exception as e:
+                return SubmissionResult('JE', reason=f'failed to parse score_multiplier.txt: {e}',
+                                       additional_info=OutputValidators._get_feedback(feedbackdir))
+            if not (0.0 <= multiplier <= 1.0):
+                return SubmissionResult('JE', reason=f'score_multiplier.txt value {multiplier} is not in [0, 1]')
+
+            # Compute score from multiplier and max score per test case
+            # The actual max score per test case depends on the group configuration
+            # For now, store the multiplier as the score - the TestCaseGroup will adjust
+            score = multiplier  # Will be multiplied by max test case score in _init_result_for_testcase
+
+        # If no score file and problem is scoring, the score will be determined by the test case config
+        # (default for bounded: max_score per case; required for unbounded: must produce score.txt)
+        return SubmissionResult('AC', score=score)
+
     def _actual_validators(self) -> list:
         if self.uses_default_validator():
             return [self._default_validator]
         return self._validators
 
-    def validate_interactive(
-        self,
-        testcase: TestCase,
-        submission,
-        timelim: float,
-        errorhandler: Submissions,
-        infile: str | None = None,
-        feedback_dir_path: str | None = None,
-    ) -> SubmissionResult:
+    def validate_interactive(self, testcase, submission, timelim: int, errorhandler: Submissions) -> SubmissionResult:
         # This may be called off-main thread.
         interactive_output_re = r'\d+ \d+\.\d+ \d+ \d+\.\d+ (validator|submission)'
         res = SubmissionResult('JE')
@@ -1593,16 +2387,17 @@ class OutputValidators(ProblemPart):
                     return res
         return res
 
-    def validate(
-        self, testcase: TestCase, submission_output: str, infile: str | None = None, feedback_dir_path: str | None = None
-    ) -> SubmissionResult:
-        """
-        Run all output validators on the given test case and submission output.
-        Parameters:
-            testcase: The test case we are validating.
-            submission_output: Path to out file of submission.
-            infile: The input file. Overrides testcase.infile if we are running multipass.
-            feedback_dir_path: Path to feedback directory. If None, a temporary directory will be created and cleaned up.
+    def validate(self, testcase, submission_output: str, feedbackdir: str | None = None) -> SubmissionResult:
+        """Validate submission output against expected answer.
+
+        Args:
+            testcase: The test case being validated
+            submission_output: Path to file with submission output
+            feedbackdir: If provided, use this feedback directory (and don't delete it).
+                         Used for multi-pass to persist feedback between passes.
+
+        Returns:
+            SubmissionResult with verdict
         """
         res = SubmissionResult('JE')
         val_timelim = self.problem.metadata.limits.validation_time
@@ -1610,19 +2405,11 @@ class OutputValidators(ProblemPart):
         flags = (
             self.problem.metadata.legacy_validator_flags.split() + testcase.testcasegroup.config['output_validator_flags'].split()
         )
-        for i, val in enumerate(self._actual_validators()):
+        caller_owns_feedbackdir = feedbackdir is not None
+        for val in self._actual_validators():
             if val.compile()[0]:
-                # If we are running multiple output validators in legacy, make sure to wipe it
-                # If we are running multipass, i will always be 0 and we do not accidentally wipe feedback
-                if i > 0 and feedback_dir_path:
-                    shutil.rmtree(feedback_dir_path)
-                    Path(feedback_dir_path).mkdir()
-
-                if feedback_dir_path:
-                    feedbackdir = feedback_dir_path
-                else:
+                if not caller_owns_feedbackdir:
                     feedbackdir = tempfile.mkdtemp(prefix='feedback', dir=self.problem.tmpdir)
-
                 validator_output = tempfile.mkdtemp(prefix='checker_out', dir=self.problem.tmpdir)
                 outfile = validator_output + '/out.txt'
                 errfile = validator_output + '/err.txt'
@@ -1647,6 +2434,8 @@ class OutputValidators(ProblemPart):
                     except IOError as e:
                         self.info('Failed to read validator output: %s', e)
                 res = self._parse_validator_results(val, status, feedbackdir, testcase)
+                if not caller_owns_feedbackdir:
+                    shutil.rmtree(feedbackdir)
                 shutil.rmtree(validator_output)
                 if feedback_dir_path is None:
                     shutil.rmtree(feedbackdir)
@@ -1655,6 +2444,358 @@ class OutputValidators(ProblemPart):
 
         # TODO: check that all output validators give same result
         return res
+
+
+class StaticValidator(ProblemPart):
+    """Represents the static validator (2025-09 only).
+
+    Static validators analyze submission source code to accept/reject submissions.
+    They can optionally assign scores for static validation test cases.
+    """
+
+    PART_NAME = 'static_validator'
+
+    def setup(self):
+        static_dir = os.path.join(self.problem.probdir, 'static_validator')
+        if os.path.isdir(static_dir):
+            self._programs = run.find_programs(
+                static_dir,
+                language_config=self.problem.language_config,
+                work_dir=self.problem.tmpdir,
+            )
+            # Substitute constants in static validator source files (2025-09 only)
+            if self.problem.format is FormatVersion.V_2025_09 and self.problem.metadata.constants:
+                for prog in self._programs:
+                    if hasattr(prog, 'path') and os.path.isdir(prog.path):
+                        undef = statement_util.substitute_constants_in_directory(prog.path, self.problem.metadata.constants)
+                        for ref in undef:
+                            self.warning("Undefined constant '{{%s}}' in static validator %s" % (ref, prog))
+        else:
+            self._programs = []
+
+    def __str__(self) -> str:
+        return 'static validator'
+
+    def has_static_validator(self) -> bool:
+        return len(self._programs) > 0
+
+    def check(self, context: Context) -> bool:
+        if self._check_res is not None:
+            return self._check_res
+        self._check_res = True
+
+        if self.problem.format is FormatVersion.LEGACY:
+            if self._programs:
+                self.error("static_validator/ is not supported in legacy format")
+            return self._check_res
+
+        if not self._programs:
+            return self._check_res
+
+        if self.problem.is_submit_answer():
+            self.error("static_validator/ is not allowed for submit-answer problems")
+
+        if len(self._programs) > 1:
+            self.warning(f'Found {len(self._programs)} static validators; expected at most 1')
+
+        for prog in self._programs:
+            _check_validator_language(self, prog, 'Static validator')
+            success, msg = prog.compile()
+            if not success:
+                self.error(f'Compile error for static validator {prog}', msg)
+
+        # Check that static_validation_score is only specified if we have a static validator
+        # This is checked in TestCaseGroup._check_2025_09 already
+
+        return self._check_res
+
+
+class OutputVisualizer(ProblemPart):
+    """Represents the output visualizer (2025-09 only).
+
+    Output visualizers generate images illustrating submission output.
+    They run after the output validator.
+    """
+
+    PART_NAME = 'output_visualizer'
+
+    def setup(self):
+        visualizer_dir = os.path.join(self.problem.probdir, 'output_visualizer')
+        if os.path.isdir(visualizer_dir):
+            self._programs = run.find_programs(
+                visualizer_dir,
+                language_config=self.problem.language_config,
+                work_dir=self.problem.tmpdir,
+            )
+        else:
+            self._programs = []
+
+    def __str__(self) -> str:
+        return 'output visualizer'
+
+    def has_output_visualizer(self) -> bool:
+        return len(self._programs) > 0
+
+    def check(self, context: Context) -> bool:
+        if self._check_res is not None:
+            return self._check_res
+        self._check_res = True
+
+        if self.problem.format is FormatVersion.LEGACY:
+            if self._programs:
+                self.error("output_visualizer/ is not supported in legacy format")
+            return self._check_res
+
+        if not self._programs:
+            return self._check_res
+
+        if len(self._programs) > 1:
+            self.warning(f'Found {len(self._programs)} output visualizers; expected at most 1')
+
+        for prog in self._programs:
+            _check_validator_language(self, prog, 'Output visualizer')
+            success, msg = prog.compile()
+            if not success:
+                # Compile errors in visualizers are not judge errors
+                self.warning(f'Compile error for output visualizer {prog}: {msg}')
+
+        return self._check_res
+
+
+class InputVisualizer(ProblemPart):
+    """Represents the input visualizer (2025-09 only).
+
+    Input visualizers generate test case illustrations.
+    They are informational only and not invoked by the judging system.
+    """
+
+    PART_NAME = 'input_visualizer'
+
+    def setup(self):
+        visualizer_dir = os.path.join(self.problem.probdir, 'input_visualizer')
+        if os.path.isdir(visualizer_dir):
+            self._programs = run.find_programs(
+                visualizer_dir,
+                language_config=self.problem.language_config,
+                work_dir=self.problem.tmpdir,
+            )
+        else:
+            self._programs = []
+
+    def __str__(self) -> str:
+        return 'input visualizer'
+
+    def check(self, context: Context) -> bool:
+        if self._check_res is not None:
+            return self._check_res
+        self._check_res = True
+
+        if self.problem.format is FormatVersion.LEGACY:
+            if self._programs:
+                self.warning("input_visualizer/ is not typically used in legacy format")
+            return self._check_res
+
+        if not self._programs:
+            return self._check_res
+
+        for prog in self._programs:
+            _check_validator_language(self, prog, 'Input visualizer')
+            success, msg = prog.compile()
+            if not success:
+                # Compile errors in visualizers are informational only
+                self.warning(f'Compile error for input visualizer {prog}: {msg}')
+
+        return self._check_res
+
+
+class ValidationTestData(ProblemPart):
+    """Validates data/invalid_input/, data/invalid_output/, and data/valid_output/ (2025-09 only)."""
+
+    PART_NAME = 'validation_test_data'
+
+    def setup(self):
+        datadir = os.path.join(self.problem.probdir, 'data')
+        self._invalid_inputs: list[str] = []  # .in files
+        self._invalid_outputs: list[tuple[str, str, str]] = []  # (.in, .out, .ans) files
+        self._valid_outputs: list[tuple[str, str, str]] = []  # (.in, .out, .ans) files
+
+        invalid_input_dir = os.path.join(datadir, 'invalid_input')
+        if os.path.isdir(invalid_input_dir):
+            self._collect_invalid_inputs(invalid_input_dir)
+
+        invalid_output_dir = os.path.join(datadir, 'invalid_output')
+        if os.path.isdir(invalid_output_dir):
+            self._collect_output_cases(invalid_output_dir, self._invalid_outputs)
+
+        valid_output_dir = os.path.join(datadir, 'valid_output')
+        if os.path.isdir(valid_output_dir):
+            self._collect_output_cases(valid_output_dir, self._valid_outputs)
+
+    def _collect_invalid_inputs(self, dirpath: str) -> None:
+        """Recursively collect .in files from invalid_input directory tree."""
+        for root, dirs, files in os.walk(dirpath):
+            for f in sorted(files):
+                if f.endswith('.in'):
+                    self._invalid_inputs.append(os.path.join(root, f))
+
+    def _collect_output_cases(self, dirpath: str, target: list[tuple[str, str, str]]) -> None:
+        """Recursively collect (.in, .out, .ans) triples from invalid_output/valid_output directories."""
+        for root, dirs, files in os.walk(dirpath):
+            in_files = {f for f in files if f.endswith('.in')}
+            for inf in sorted(in_files):
+                base = inf[:-3]
+                inpath = os.path.join(root, inf)
+                outpath = os.path.join(root, f'{base}.out')
+                anspath = os.path.join(root, f'{base}.ans')
+                target.append((inpath, outpath, anspath))
+
+    def __str__(self) -> str:
+        return 'validation test data'
+
+    def check(self, context: Context) -> bool:
+        if self._check_res is not None:
+            return self._check_res
+        self._check_res = True
+
+        if self.problem.format is FormatVersion.LEGACY:
+            # Legacy format doesn't support validation directories
+            datadir = os.path.join(self.problem.probdir, 'data')
+            for dirname in ('invalid_input', 'invalid_output', 'valid_output'):
+                if os.path.isdir(os.path.join(datadir, dirname)):
+                    self.error(f'Validation directory "{dirname}" is not allowed in legacy format')
+            return self._check_res
+
+        self._check_invalid_inputs()
+        self._check_invalid_outputs()
+        self._check_valid_outputs()
+
+        return self._check_res
+
+    def _check_invalid_inputs(self) -> None:
+        """Each .in file under invalid_input must be rejected by at least one input validator."""
+        if not self._invalid_inputs:
+            return
+
+        self.info(f'Checking {len(self._invalid_inputs)} invalid input file(s)')
+
+        # Ensure input validators are compiled
+        self.problem.input_validators.check(None)
+
+        for infile in self._invalid_inputs:
+            relpath = os.path.relpath(infile, self.problem.probdir)
+            rejected = False
+            for val in self.problem.input_validators._validators:
+                with tempfile.NamedTemporaryFile() as outf, tempfile.NamedTemporaryFile() as errf:
+                    status, _ = val.run(infile, outf.name, errf.name, args=[])
+                    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 42:
+                        rejected = True
+                        break
+            if not rejected:
+                self.error(f'Invalid input file {relpath} was accepted by all input validators (should be rejected by at least one)')
+
+    def _check_invalid_outputs(self) -> None:
+        """Each case under invalid_output: .in must be valid input, .out must fail output validation with .ans."""
+        if not self._invalid_outputs:
+            return
+
+        self.info(f'Checking {len(self._invalid_outputs)} invalid output case(s)')
+
+        for infile, outfile, ansfile in self._invalid_outputs:
+            relpath = os.path.relpath(infile, self.problem.probdir)
+
+            # Check that .in file exists and is valid input
+            if not os.path.isfile(infile):
+                self.error(f'Missing input file {relpath}')
+                continue
+
+            # Validate input
+            for val in self.problem.input_validators._validators:
+                with tempfile.NamedTemporaryFile() as outf, tempfile.NamedTemporaryFile() as errf:
+                    status, _ = val.run(infile, outf.name, errf.name, args=[])
+                    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 42:
+                        self.error(f'Input file {relpath} in invalid_output is not valid input (rejected by input validator)')
+                        break
+
+            # Check that .out exists
+            if not os.path.isfile(outfile):
+                self.error(f'Missing .out file for {relpath}')
+                continue
+
+            # Check that .ans exists
+            if not os.path.isfile(ansfile):
+                self.error(f'Missing .ans file for {relpath}')
+                continue
+
+            # Create a temporary TestCase-like object for the output validator
+            # The .out must fail output validation with .ans
+            tc = _ValidationTestCaseProxy(self.problem, infile, ansfile)
+            result = self.problem.output_validators.validate(tc, outfile)
+            if result.verdict == 'AC':
+                relout = os.path.relpath(outfile, self.problem.probdir)
+                self.error(f'Invalid output file {relout} was accepted by output validator (should be rejected)')
+
+    def _check_valid_outputs(self) -> None:
+        """Each case under valid_output: .in must be valid input, .out must pass output validation with .ans."""
+        if not self._valid_outputs:
+            return
+
+        self.info(f'Checking {len(self._valid_outputs)} valid output case(s)')
+
+        for infile, outfile, ansfile in self._valid_outputs:
+            relpath = os.path.relpath(infile, self.problem.probdir)
+
+            # Check that .in file exists and is valid input
+            if not os.path.isfile(infile):
+                self.error(f'Missing input file {relpath}')
+                continue
+
+            # Validate input
+            for val in self.problem.input_validators._validators:
+                with tempfile.NamedTemporaryFile() as outf, tempfile.NamedTemporaryFile() as errf:
+                    status, _ = val.run(infile, outf.name, errf.name, args=[])
+                    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 42:
+                        self.error(f'Input file {relpath} in valid_output is not valid input (rejected by input validator)')
+                        break
+
+            # Check that .out exists
+            if not os.path.isfile(outfile):
+                self.error(f'Missing .out file for {relpath}')
+                continue
+
+            # Check that .ans exists
+            if not os.path.isfile(ansfile):
+                self.error(f'Missing .ans file for {relpath}')
+                continue
+
+            # The .out must pass output validation with .ans
+            tc = _ValidationTestCaseProxy(self.problem, infile, ansfile)
+            result = self.problem.output_validators.validate(tc, outfile)
+            if result.verdict != 'AC':
+                relout = os.path.relpath(outfile, self.problem.probdir)
+                self.error(f'Valid output file {relout} was rejected by output validator: {result}')
+
+
+class _ValidationTestCaseProxy:
+    """Minimal proxy object for OutputValidators.validate() that mimics a TestCase for validation directories."""
+
+    def __init__(self, problem: Problem, infile: str, ansfile: str):
+        self.infile = infile
+        self.ansfile = ansfile
+        self._problem = problem
+        # Provide a minimal config-like testcasegroup for output_validator_flags
+        self.testcasegroup = _ValidationGroupProxy(problem)
+
+    def is_in_sample_group(self) -> bool:
+        return False
+
+
+class _ValidationGroupProxy:
+    """Minimal proxy for TestCaseGroup that provides the config needed by OutputValidators.validate()."""
+
+    def __init__(self, problem: Problem):
+        self.config = {
+            'output_validator_flags': '',
+        }
 
 
 class Runner:
@@ -1764,53 +2905,502 @@ class Runner:
             self._remaining_jobs.reverse()
 
 
+class _SubmissionDir:
+    """Configuration for a submission directory."""
+    __slots__ = ('name', 'accepted_verdicts', 'must_exist', 'is_partial',
+                 'permitted', 'required')
+
+    def __init__(self, name: str, accepted_verdicts: frozenset[str], must_exist: bool = False, is_partial: bool = False,
+                 permitted: frozenset[str] | None = None, required: frozenset[str] | None = None):
+        self.name = name
+        self.accepted_verdicts = accepted_verdicts
+        self.must_exist = must_exist
+        # For legacy partially_accepted: run with relaxed time limit, warn if fully accepted
+        self.is_partial = is_partial
+        # 2025-09: permitted/required sets derived from submissions.yaml or defaults
+        self.permitted = permitted
+        self.required = required
+
+    def verdict_ok(self, verdict: str) -> bool:
+        return verdict in self.accepted_verdicts
+
+
+def _brace_expand(pattern: str) -> list[str]:
+    """Expand brace patterns in a glob string.
+
+    Supports simple brace expansion like {a,b,c} but not nested braces.
+    Returns a list of expanded patterns.
+
+    Examples:
+        'foo.{py,cpp}' -> ['foo.py', 'foo.cpp']
+        '{simple,complex}.py' -> ['simple.py', 'complex.py']
+        'noBraces' -> ['noBraces']
+    """
+    # Find the first top-level brace pair
+    depth = 0
+    start = -1
+    for i, ch in enumerate(pattern):
+        if ch == '{' and depth == 0:
+            start = i
+            depth = 1
+        elif ch == '{':
+            depth += 1
+        elif ch == '}' and depth == 1:
+            # Found matching brace
+            prefix = pattern[:start]
+            suffix = pattern[i + 1:]
+            alternatives = pattern[start + 1:i].split(',')
+            results = []
+            for alt in alternatives:
+                results.extend(_brace_expand(prefix + alt + suffix))
+            return results
+        elif ch == '}':
+            depth -= 1
+    return [pattern]
+
+
+def _glob_match(pattern: str, path: str) -> bool:
+    """Match a glob pattern against a path.
+
+    * matches anything except /. No ** support. No [xyz] support.
+    Brace expansion is handled before calling this.
+    """
+    import fnmatch
+    # fnmatch doesn't handle path separators - we need to ensure * doesn't match /
+    # Split both pattern and path by / and match each component
+    pattern_parts = pattern.split('/')
+    path_parts = path.split('/')
+    if len(pattern_parts) != len(path_parts):
+        return False
+    return all(fnmatch.fnmatch(pp, pat) for pat, pp in zip(pattern_parts, path_parts))
+
+
+def _submission_matches_glob(glob_pattern: str, submission_path: str) -> bool:
+    """Check if a submission path matches a glob pattern.
+
+    submission_path is relative to submissions/ (e.g. 'accepted/hello.py').
+    A submission is matched if either itself or a parent directory is matched.
+    """
+    for expanded in _brace_expand(glob_pattern):
+        if _glob_match(expanded, submission_path):
+            return True
+        # Also check if a parent directory of submission_path matches
+        parts = submission_path.split('/')
+        for i in range(1, len(parts)):
+            parent = '/'.join(parts[:i])
+            if _glob_match(expanded, parent):
+                return True
+    return False
+
+
+def _testdata_matches_glob(glob_pattern: str, testdata_path: str) -> bool:
+    """Check if a test data path matches a glob pattern.
+
+    testdata_path is relative to data/ (e.g. 'secret/group1/case01').
+    A test case is matched if either itself or any parent group is matched.
+    """
+    for expanded in _brace_expand(glob_pattern):
+        if _glob_match(expanded, testdata_path):
+            return True
+        # Check parent groups
+        parts = testdata_path.split('/')
+        for i in range(1, len(parts)):
+            parent = '/'.join(parts[:i])
+            if _glob_match(expanded, parent):
+                return True
+    return False
+
+
+_VALID_VERDICTS = frozenset({'AC', 'WA', 'TLE', 'RTE'})
+
+_SUBMISSIONS_YAML_TOP_KEYS = frozenset({
+    'language', 'entrypoint', 'authors', 'model_solution',
+    'permitted', 'required', 'score', 'message', 'use_for_time_limit',
+})
+
+# Default submission directory configs for 2025-09 (from spec)
+_DEFAULT_SUBMISSION_RULES_2025_09: dict[str, dict[str, Any]] = {
+    'accepted': {
+        'permitted': ['AC'],
+    },
+    'rejected': {
+        'required': ['RTE', 'TLE', 'WA'],
+    },
+    'wrong_answer': {
+        'permitted': ['AC', 'WA'],
+        'required': ['WA'],
+    },
+    'time_limit_exceeded': {
+        'permitted': ['AC', 'TLE'],
+        'required': ['TLE'],
+    },
+    'run_time_error': {
+        'permitted': ['AC', 'RTE'],
+        'required': ['RTE'],
+    },
+    'brute_force': {
+        'permitted': ['AC', 'RTE', 'TLE'],
+        'required': ['RTE', 'TLE'],
+    },
+}
+
+
+class _SubmissionConstraint:
+    """A parsed constraint from submissions.yaml, applied to a specific glob pattern."""
+    __slots__ = ('glob_pattern', 'permitted', 'required', 'score', 'message',
+                 'use_for_time_limit', 'language', 'entrypoint', 'authors',
+                 'model_solution', 'group_constraints')
+
+    def __init__(self, glob_pattern: str, config: dict[str, Any]):
+        self.glob_pattern = glob_pattern
+        self.permitted = _parse_verdict_set(config.get('permitted'))
+        self.required = _parse_verdict_set(config.get('required'))
+        self.score = config.get('score')  # float or [float, float]
+        self.message = config.get('message')  # str
+        self.use_for_time_limit = config.get('use_for_time_limit')  # bool or 'lower'/'upper'
+        self.language = config.get('language')
+        self.entrypoint = config.get('entrypoint')
+        self.authors = config.get('authors')
+        self.model_solution = config.get('model_solution', False)
+        # Per-group constraints: group_name -> {permitted, required, score, message, use_for_time_limit}
+        self.group_constraints: dict[str, dict[str, Any]] = {}
+        for key, value in config.items():
+            if key not in _SUBMISSIONS_YAML_TOP_KEYS and isinstance(value, dict):
+                self.group_constraints[key] = value
+
+
+def _parse_verdict_set(verdicts: list[str] | None) -> frozenset[str] | None:
+    """Parse a list of verdicts into a frozenset, or None if not specified."""
+    if verdicts is None:
+        return None
+    return frozenset(verdicts)
+
+
+_SUBMISSION_DIRS_LEGACY: list[_SubmissionDir] = [
+    _SubmissionDir('accepted', frozenset({'AC'}), must_exist=True),
+    _SubmissionDir('partially_accepted', frozenset({'AC'}), is_partial=True),
+    _SubmissionDir('wrong_answer', frozenset({'WA'})),
+    _SubmissionDir('run_time_error', frozenset({'RTE'})),
+    _SubmissionDir('time_limit_exceeded', frozenset({'TLE'})),
+]
+
+_SUBMISSION_DIRS_2025_09: list[_SubmissionDir] = [
+    _SubmissionDir('accepted', frozenset({'AC'}), must_exist=True),
+    _SubmissionDir('rejected', frozenset({'WA', 'RTE', 'TLE'})),
+    _SubmissionDir('wrong_answer', frozenset({'WA'})),
+    _SubmissionDir('time_limit_exceeded', frozenset({'TLE'})),
+    _SubmissionDir('run_time_error', frozenset({'RTE'})),
+    _SubmissionDir('brute_force', frozenset({'RTE', 'TLE'})),
+]
+
+
 class Submissions(ProblemPart):
-    # (verdict, directory, required)
-    _VERDICTS: list[tuple[Verdict, str, bool]] = [
-        ('AC', 'accepted', True),
-        ('PAC', 'partially_accepted', False),
-        ('WA', 'wrong_answer', False),
-        ('RTE', 'run_time_error', False),
-        ('TLE', 'time_limit_exceeded', False),
-    ]
+    _SUB_REGEXP = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*[a-zA-Z0-9](\.c\+\+)?$')
 
     PART_NAME = 'submission'
 
+    @property
+    def _submission_dirs(self) -> list[_SubmissionDir]:
+        if self.problem.format is FormatVersion.LEGACY:
+            return _SUBMISSION_DIRS_LEGACY
+        return _SUBMISSION_DIRS_2025_09
+
     def setup(self):
-        self._submissions = {}
+        self._submissions: dict[str, list] = {}
+        self._constraints: list[_SubmissionConstraint] = []
+        # Track per-testcase results for submissions.yaml validation
+        # Key: (submission_path, testcase_path) -> SubmissionResult
+        self._testcase_results: dict[tuple[str, str], SubmissionResult] = {}
+        # Track per-group results for submissions.yaml validation
+        # Key: (submission_path, group_path) -> SubmissionResult
+        self._submission_group_results: dict[tuple[str, str], SubmissionResult] = {}
+
         srcdir = os.path.join(self.problem.probdir, 'submissions')
-        for verdict in Submissions._VERDICTS:
-            acr = verdict[0]
-            self._submissions[acr] = run.find_programs(
-                os.path.join(srcdir, verdict[1]),
+        for sdir in self._submission_dirs:
+            self._submissions[sdir.name] = run.find_programs(
+                os.path.join(srcdir, sdir.name),
                 language_config=self.problem.language_config,
                 work_dir=self.problem.tmpdir,
                 include_dir=os.path.join(self.problem.probdir, 'include'),
             )
+
+        # Substitute constants in submission source files (2025-09 only)
+        if self.problem.format is FormatVersion.V_2025_09 and self.problem.metadata.constants:
+            for sdir in self._submission_dirs:
+                for sub in self._submissions.get(sdir.name, []):
+                    if hasattr(sub, 'path') and os.path.isdir(sub.path):
+                        undef = statement_util.substitute_constants_in_directory(sub.path, self.problem.metadata.constants)
+                        for ref in undef:
+                            self.warning("Undefined constant '{{%s}}' in submission %s" % (ref, sub))
+
+        # Parse submissions.yaml for 2025-09 format
+        if self.problem.format is FormatVersion.V_2025_09:
+            self._parse_submissions_yaml(srcdir)
+
         return {}
+
+    def _parse_submissions_yaml(self, srcdir: str) -> None:
+        """Parse submissions/submissions.yaml for 2025-09 format."""
+        yaml_path = os.path.join(srcdir, 'submissions.yaml')
+        if not os.path.isfile(yaml_path):
+            return
+
+        try:
+            with open(yaml_path, 'r') as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            self.error(f'Failed to parse submissions.yaml: {e}')
+            return
+
+        if data is None:
+            return
+        if not isinstance(data, dict):
+            self.error('submissions.yaml must be a YAML mapping (dict)')
+            return
+
+        for glob_pattern, config_val in data.items():
+            if not isinstance(glob_pattern, str):
+                self.error(f'submissions.yaml key must be a string, got {type(glob_pattern).__name__}')
+                continue
+            if config_val is None:
+                config_val = {}
+            if not isinstance(config_val, dict):
+                self.error(f'submissions.yaml value for "{glob_pattern}" must be a mapping, got {type(config_val).__name__}')
+                continue
+
+            # Validate top-level keys and identify group constraint keys
+            for key in config_val:
+                if key not in _SUBMISSIONS_YAML_TOP_KEYS and not isinstance(config_val[key], dict):
+                    self.warning(f'Unknown key "{key}" in submissions.yaml for pattern "{glob_pattern}"')
+
+            # Validate verdict sets
+            self._validate_verdict_list(config_val.get('permitted'), f'{glob_pattern}.permitted')
+            self._validate_verdict_list(config_val.get('required'), f'{glob_pattern}.required')
+
+            # Validate score
+            score = config_val.get('score')
+            if score is not None:
+                if isinstance(score, list):
+                    if len(score) != 2 or not all(isinstance(s, (int, float)) for s in score):
+                        self.error(f'submissions.yaml "{glob_pattern}": score must be a float or [float, float], got {score}')
+                elif not isinstance(score, (int, float)):
+                    self.error(f'submissions.yaml "{glob_pattern}": score must be a float or [float, float], got {type(score).__name__}')
+
+            # Validate use_for_time_limit
+            uftl = config_val.get('use_for_time_limit')
+            if uftl is not None and uftl not in (True, False, 'lower', 'upper'):
+                self.error(f'submissions.yaml "{glob_pattern}": use_for_time_limit must be bool or "lower"/"upper", got {uftl}')
+
+            # Validate per-group constraints
+            for key, value in config_val.items():
+                if key not in _SUBMISSIONS_YAML_TOP_KEYS and isinstance(value, dict):
+                    self._validate_verdict_list(value.get('permitted'), f'{glob_pattern}.{key}.permitted')
+                    self._validate_verdict_list(value.get('required'), f'{glob_pattern}.{key}.required')
+                    group_score = value.get('score')
+                    if group_score is not None:
+                        if isinstance(group_score, list):
+                            if len(group_score) != 2 or not all(isinstance(s, (int, float)) for s in group_score):
+                                self.error(f'submissions.yaml "{glob_pattern}.{key}": score must be a float or [float, float]')
+                        elif not isinstance(group_score, (int, float)):
+                            self.error(f'submissions.yaml "{glob_pattern}.{key}": score must be a float or [float, float]')
+
+            constraint = _SubmissionConstraint(glob_pattern, config_val)
+            self._constraints.append(constraint)
+
+        self.info(f'Parsed {len(self._constraints)} constraints from submissions.yaml')
+
+    def _validate_verdict_list(self, verdicts: list | None, context: str) -> None:
+        """Validate a verdict list from submissions.yaml."""
+        if verdicts is None:
+            return
+        if not isinstance(verdicts, list):
+            self.error(f'submissions.yaml {context}: must be a list of verdicts, got {type(verdicts).__name__}')
+            return
+        for v in verdicts:
+            if v not in _VALID_VERDICTS:
+                self.error(f'submissions.yaml {context}: unknown verdict "{v}" (valid: {", ".join(sorted(_VALID_VERDICTS))})')
+
+    def _collect_testcase_paths(self, group: TestCaseGroup) -> list[str]:
+        """Collect all testcase paths relative to data/ from a test case group."""
+        data_dir = os.path.join(self.problem.probdir, 'data')
+        paths = []
+        for tc in group.get_testcases():
+            rel = os.path.relpath(tc.infile, data_dir)
+            # Remove .in extension
+            if rel.endswith('.in'):
+                rel = rel[:-3]
+            paths.append(rel)
+        for subgroup in group.get_subgroups():
+            paths.extend(self._collect_testcase_paths(subgroup))
+        return paths
+
+    def _collect_group_paths(self, group: TestCaseGroup) -> list[str]:
+        """Collect all group paths relative to data/ from a test case group."""
+        data_dir = os.path.join(self.problem.probdir, 'data')
+        paths = []
+        rel = os.path.relpath(group._datadir, data_dir)
+        paths.append(rel)
+        for subgroup in group.get_subgroups():
+            paths.extend(self._collect_group_paths(subgroup))
+        return paths
+
+    def _check_submission_constraints(self, sub_path: str, result: SubmissionResult) -> None:
+        """Check submissions.yaml constraints for a specific submission after it has been run.
+
+        Args:
+            sub_path: Submission path relative to submissions/, e.g. 'accepted/hello.py'
+            result: The overall submission result
+        """
+        tc_verdicts = dict(self.problem._testcase_verdicts)  # snapshot
+        group_results = dict(self.problem._group_results)  # snapshot
+
+        for constraint in self._constraints:
+            if not _submission_matches_glob(constraint.glob_pattern, sub_path):
+                continue
+
+            # Check top-level permitted/required against all test cases
+            all_verdicts = [r.verdict for r in tc_verdicts.values()]
+
+            if constraint.permitted is not None:
+                for tc_path, tc_res in tc_verdicts.items():
+                    if tc_res.verdict not in constraint.permitted:
+                        self.error(
+                            f'submissions.yaml: submission {sub_path} got verdict {tc_res.verdict} on {tc_path}, '
+                            f'but only {sorted(constraint.permitted)} are permitted (pattern: {constraint.glob_pattern})'
+                        )
+                        break  # One error per constraint per submission is enough
+
+            if constraint.required is not None:
+                has_required = any(v in constraint.required for v in all_verdicts)
+                if not has_required:
+                    self.error(
+                        f'submissions.yaml: submission {sub_path} has no test case with verdict in {sorted(constraint.required)} '
+                        f'(pattern: {constraint.glob_pattern}), got verdicts: {sorted(set(all_verdicts))}'
+                    )
+
+            # Check score constraint
+            if constraint.score is not None and result.score is not None:
+                if isinstance(constraint.score, list):
+                    lo, hi = constraint.score
+                    if not (lo <= result.score <= hi):
+                        self.error(
+                            f'submissions.yaml: submission {sub_path} got score {result.score}, '
+                            f'expected [{lo}, {hi}] (pattern: {constraint.glob_pattern})'
+                        )
+                else:
+                    if result.score != constraint.score:
+                        self.error(
+                            f'submissions.yaml: submission {sub_path} got score {result.score}, '
+                            f'expected {constraint.score} (pattern: {constraint.glob_pattern})'
+                        )
+
+            # Check message constraint
+            if constraint.message is not None:
+                has_message = False
+                for tc_path, tc_res in tc_verdicts.items():
+                    if tc_res.additional_info and constraint.message in tc_res.additional_info:
+                        has_message = True
+                        break
+                if not has_message:
+                    self.error(
+                        f'submissions.yaml: submission {sub_path} has no test case with message containing '
+                        f'"{constraint.message}" (pattern: {constraint.glob_pattern})'
+                    )
+
+            # Check per-group constraints
+            for group_pattern, group_config in constraint.group_constraints.items():
+                group_tc_verdicts = {
+                    tc_path: tc_res
+                    for tc_path, tc_res in tc_verdicts.items()
+                    if _testdata_matches_glob(group_pattern, tc_path)
+                }
+
+                if not group_tc_verdicts:
+                    self.debug(
+                        f'submissions.yaml: no test cases matched group pattern "{group_pattern}" for {sub_path}'
+                    )
+                    continue
+
+                group_verdicts = [r.verdict for r in group_tc_verdicts.values()]
+
+                group_permitted = _parse_verdict_set(group_config.get('permitted'))
+                if group_permitted is not None:
+                    for tc_path, tc_res in group_tc_verdicts.items():
+                        if tc_res.verdict not in group_permitted:
+                            self.error(
+                                f'submissions.yaml: submission {sub_path} got verdict {tc_res.verdict} on {tc_path}, '
+                                f'but only {sorted(group_permitted)} are permitted (pattern: {constraint.glob_pattern}, group: {group_pattern})'
+                            )
+                            break
+
+                group_required = _parse_verdict_set(group_config.get('required'))
+                if group_required is not None:
+                    has_required = any(v in group_required for v in group_verdicts)
+                    if not has_required:
+                        self.error(
+                            f'submissions.yaml: submission {sub_path} has no test case in group "{group_pattern}" '
+                            f'with verdict in {sorted(group_required)} (pattern: {constraint.glob_pattern}), '
+                            f'got verdicts: {sorted(set(group_verdicts))}'
+                        )
+
+                # Check per-group score constraint
+                group_score = group_config.get('score')
+                if group_score is not None:
+                    # Find the group result for this group pattern
+                    matching_group_result = None
+                    for gname, gresult in group_results.items():
+                        if _testdata_matches_glob(group_pattern, gname) or group_pattern == gname:
+                            matching_group_result = gresult
+                            break
+                    if matching_group_result and matching_group_result.score is not None:
+                        if isinstance(group_score, list):
+                            lo, hi = group_score
+                            if not (lo <= matching_group_result.score <= hi):
+                                self.error(
+                                    f'submissions.yaml: submission {sub_path} got score {matching_group_result.score} '
+                                    f'on group "{group_pattern}", expected [{lo}, {hi}] (pattern: {constraint.glob_pattern})'
+                                )
+                        elif matching_group_result.score != group_score:
+                            self.error(
+                                f'submissions.yaml: submission {sub_path} got score {matching_group_result.score} '
+                                f'on group "{group_pattern}", expected {group_score} (pattern: {constraint.glob_pattern})'
+                            )
+
+                # Check per-group message constraint
+                group_message = group_config.get('message')
+                if group_message is not None:
+                    has_msg = any(
+                        tc_res.additional_info and group_message in tc_res.additional_info
+                        for tc_res in group_tc_verdicts.values()
+                    )
+                    if not has_msg:
+                        self.error(
+                            f'submissions.yaml: submission {sub_path} has no test case in group "{group_pattern}" '
+                            f'with message containing "{group_message}" (pattern: {constraint.glob_pattern})'
+                        )
 
     def __str__(self) -> str:
         return 'submissions'
 
     def check_submission(
-        self, sub, context: Context, expected_verdict: Verdict, timelim: float, timelim_high: float
+        self, sub, context: Context, sdir: _SubmissionDir, timelim: int, timelim_low: int, timelim_high: int
     ) -> SubmissionResult:
-        desc = f'{expected_verdict} submission {sub}'
-        partial = False
-        if expected_verdict == 'PAC':
-            expected_verdict = 'AC'
-            partial = True
-            # For partially accepted, we don't want to use them to lower bound the time limit, but we do want
-            # to warn if they're slow enough that they would have affected the time limit, had they been used
-            # to compute it.
-            timelim_low = timelim / self.problem.metadata.limits.time_multipliers.ac_to_time_limit
+        desc = f'{sdir.name} submission {sub}'
+        partial = sdir.is_partial
+        if partial:
+            # For partially accepted solutions, use the low timelim instead of the real one,
+            # to make sure we have margin in both directions.
+            pass
         else:
             timelim_low = timelim
 
         with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high) as runner:
+            # Clear group results for require_pass tracking (2025-09)
+            self.problem._group_results.clear()
+            self.problem._testcase_verdicts.clear()
             result, result_low, result_high = self.problem.testdata.run_submission(sub, runner, context)
 
-        if result.verdict == 'AC' and expected_verdict == 'AC' and not partial and result.sample_failures:
+        if result.verdict == 'AC' and sdir.verdict_ok('AC') and not partial and result.sample_failures:
             res = result.sample_failures[0]
             self.warning(f'{desc} got {res.verdict} on sample: {res}')
 
@@ -1826,15 +3416,20 @@ class Submissions(ProblemPart):
 
         if partial and self.fully_accepted(result):
             self.warning(f'{desc} got {result}')
-        elif result.verdict == expected_verdict:
+        elif sdir.verdict_ok(result.verdict):
             self.msg(f'   {desc} OK: {result}')
-            if expected_verdict == 'AC' and not partial and not self.fully_accepted(result) and self.full_score_finite():
+            if result.verdict == 'AC' and not partial and not self.fully_accepted(result) and self.full_score_finite():
                 # For some heuristic problems, this is expected. Thus, only warn.
                 self.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
-        elif result_high.verdict == expected_verdict and not (partial and self.fully_accepted(result_high)):
+        elif sdir.verdict_ok(result_high.verdict) and not (partial and self.fully_accepted(result_high)):
             self.msg(f'   {desc} OK with extra time: {result_high}')
         else:
             self.error(f'{desc} got {result}', result_high.additional_info)
+
+        # For 2025-09: check submissions.yaml constraints
+        if self.problem.format is FormatVersion.V_2025_09 and self._constraints:
+            sub_path = os.path.join(sdir.name, str(sub.name))
+            self._check_submission_constraints(sub_path, result)
 
         return result
 
@@ -1854,27 +3449,9 @@ class Submissions(ProblemPart):
         # Send off an early background compile job for each submission and
         # validator, to avoid a bottleneck step at the start of each test run.
         self.problem.output_validators.start_background_work(context)
-        for verdict in Submissions._VERDICTS:
-            acr = verdict[0]
-            for sub in self._submissions[acr]:
-                sub_name = sub.name  # type: ignore
-                if context.submission_filter.search(os.path.join(verdict[1], sub_name)):
-                    context.submit_background_work(lambda s: s.compile(), sub)
-
-    def _compute_time_limit(self, fixed_limit: float | None, lower_bound_runtime: float | None) -> tuple[float, float]:
-        if fixed_limit is None and lower_bound_runtime is None:
-            # 5 minutes is our currently hard coded upper bound for what to allow when we don't know the time limit yet
-            return 300.0, 300.0
-
-        limits = self.problem.metadata.limits
-        if fixed_limit is not None:
-            timelim = fixed_limit
-        else:
-            assert lower_bound_runtime is not None, 'Assert to keep mypy happy'
-            exact_timelim = lower_bound_runtime * limits.time_multipliers.ac_to_time_limit
-            timelim = max(1, math.ceil(exact_timelim / limits.time_resolution)) * limits.time_resolution
-
-        return timelim, timelim * limits.time_multipliers.time_limit_to_tle
+        for dirname in self._submissions:
+            for sub in self._submissions[dirname]:
+                context.submit_background_work(lambda s: s.compile(), sub)
 
     def check(self, context: Context) -> bool:
         if self._check_res is not None:
@@ -1890,40 +3467,52 @@ class Submissions(ProblemPart):
         if limits.time_limit is not None and context.fixed_timelim is not None:
             self.warning('There is a fixed time limit in problem.yaml, and you provided one on command line. Using command line.')
 
-        for verdict in Submissions._VERDICTS:
-            acr = verdict[0]
-            if verdict[2] and not self._submissions[acr]:
-                self.error(f'Require at least one "{verdict[1]}" submission')
+        # Track per-directory runtimes for 2025-09 time limit inference
+        dir_runtimes: dict[str, list[float]] = {}
+
+        for sdir in self._submission_dirs:
+            if sdir.must_exist and not self._submissions[sdir.name]:
+                self.error(f'Require at least one "{sdir.name}" submission')
 
             runtimes = []
 
-            for sub in self._submissions[acr]:
+            for sub in self._submissions[sdir.name]:
                 sub_name = sub.name  # type: ignore
-                if context.submission_filter.search(os.path.join(verdict[1], sub_name)):
-                    self.info(f'Check {acr} submission {sub}')
+                if context.submission_filter.search(os.path.join(sdir.name, sub_name)):
+                    self.info(f'Check {sdir.name} submission {sub}')
 
                     if sub.code_size() > 1024 * limits.code:
                         self.error(
-                            f'{acr} submission {sub} has size {sub.code_size() / 1024.0:.1f} kiB, exceeds code size limit of {limits.code} kiB'
+                            f'{sdir.name} submission {sub} has size {sub.code_size() / 1024.0:.1f} kiB, exceeds code size limit of {limits.code} kiB'
                         )
                         continue
 
                     success, msg = sub.compile()
                     if not success:
-                        self.error(f'Compile error for {acr} submission {sub}', additional_info=msg)
+                        self.error(f'Compile error for {sdir.name} submission {sub}', additional_info=msg)
                         continue
 
-                    timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
-                    res = self.check_submission(sub, context, acr, timelim, timelim_high)
+                    res = self.check_submission(sub, context, sdir, timelim, timelim_margin_lo, timelim_margin)
                     runtimes.append(res.runtime)
 
-            if acr == 'AC':
-                if len(runtimes) > 0:
-                    lower_bound_runtime = max(runtimes)
+            dir_runtimes[sdir.name] = runtimes
 
-                # Helper function to format numbers with at most 3 decimals and dealing with None
-                def _f_n(number: float | None) -> str:
-                    return f'{round(number, 3):g}' if number is not None else '-'
+            if sdir.name == 'accepted':
+                if len(runtimes) > 0:
+                    max_runtime = max(runtimes)
+                    exact_timelim = max_runtime * time_multiplier
+                    max_runtime_str = f'{max_runtime:.3f}'
+                    timelim = max(1, int(0.5 + exact_timelim))
+                    timelim_margin_lo = max(1, min(int(0.5 + exact_timelim / safety_margin), timelim - 1))
+                    timelim_margin = max(timelim + 1, int(0.5 + exact_timelim * safety_margin))
+                else:
+                    max_runtime_str = None
+                if context.fixed_timelim is not None and context.fixed_timelim != timelim:
+                    self.msg(
+                        f'   Solutions give timelim of {timelim} seconds, but will use provided fixed limit of {context.fixed_timelim} seconds instead'
+                    )
+                    timelim = context.fixed_timelim
+                    timelim_margin = round(timelim * safety_margin)
 
                 if fixed_limit is not None and lower_bound_runtime is not None:
                     if lower_bound_runtime * ac_to_time_limit > fixed_limit:
@@ -1942,10 +3531,77 @@ class Submissions(ProblemPart):
                 )
                 self.problem._set_timelim(timelim)
 
+        # 2025-09: validate time limit bounds from submissions.yaml constraints
+        if self.problem.format is FormatVersion.V_2025_09:
+            self._validate_timelim_bounds_2025_09(dir_runtimes, timelim, time_multiplier, safety_margin)
+
         return self._check_res
 
+    def _validate_timelim_bounds_2025_09(
+        self, dir_runtimes: dict[str, list[float]], timelim: int,
+        time_multiplier: float, safety_margin: float
+    ) -> None:
+        """Validate that the computed time limit satisfies 2025-09 bounds.
 
-PROBLEM_PARTS = ['config', 'data', 'graders', 'statement', 'submissions', 'validators']
+        Lower bound: from submissions not permitted TLE (accepted/ by default).
+        Upper bound: from submissions requiring only TLE (time_limit_exceeded/ by default).
+        Submissions.yaml use_for_time_limit can override.
+        """
+        lower_bound = 0.0
+        upper_bound = float('inf')
+        has_lower = False
+
+        # Default directory-based bounds
+        accepted_runtimes = dir_runtimes.get('accepted', [])
+        if accepted_runtimes:
+            lower_bound = max(lower_bound, max(accepted_runtimes) * time_multiplier)
+            has_lower = True
+
+        tle_runtimes = dir_runtimes.get('time_limit_exceeded', [])
+        if tle_runtimes:
+            # Note: TLE submission runtimes may be capped at timelim_margin
+            # since they were run with the safety margin. The upper bound
+            # is T / safety_margin.
+            max_tle = max(tle_runtimes)
+            upper_bound = min(upper_bound, max_tle / safety_margin)
+
+        # Process submissions.yaml constraints for use_for_time_limit
+        for constraint in self._constraints:
+            uftl = constraint.use_for_time_limit
+            if uftl is False:
+                continue
+
+            if uftl == 'lower':
+                # Explicitly opted in as lower bound
+                # Find runtimes for matching submissions
+                for sdir_name, subs in self._submissions.items():
+                    for sub in subs:
+                        sub_path = os.path.join(sdir_name, str(sub.name))
+                        if _submission_matches_glob(sub_path, constraint.glob_pattern):
+                            if hasattr(sub, 'runtime') and sub.runtime > 0:
+                                lower_bound = max(lower_bound, sub.runtime * time_multiplier)
+                                has_lower = True
+            elif uftl == 'upper':
+                # Explicitly opted in as upper bound
+                for sdir_name, subs in self._submissions.items():
+                    for sub in subs:
+                        sub_path = os.path.join(sdir_name, str(sub.name))
+                        if _submission_matches_glob(sub_path, constraint.glob_pattern):
+                            if hasattr(sub, 'runtime') and sub.runtime > 0:
+                                upper_bound = min(upper_bound, sub.runtime / safety_margin)
+
+        if not has_lower:
+            self.warning('No submission provides a lower bound for the time limit (2025-09 requires at least one)')
+
+        if lower_bound > 0 and upper_bound < float('inf') and lower_bound > upper_bound:
+            self.warning(
+                'Time limit bounds are inconsistent: lower bound %.3f > upper bound %.3f '
+                '(from accepted/TLE submissions and submissions.yaml constraints)'
+                % (lower_bound, upper_bound)
+            )
+
+
+PROBLEM_PARTS = ['config', 'data', 'graders', 'statement', 'submissions', 'validation_test_data', 'validators', 'visualizers']
 
 
 class Problem(ProblemAspect):
@@ -1961,6 +3617,11 @@ class Problem(ProblemAspect):
         self._metadata: metadata.Metadata | None = None
         self._args = args
         self._timelim: float | None = None
+        # Track group results for require_pass checking (2025-09)
+        self._group_results: dict[str, SubmissionResult] = {}
+        # Track per-testcase results for submissions.yaml validation (2025-09)
+        # Key: testcase path relative to data/ (without .in) -> SubmissionResult
+        self._testcase_verdicts: dict[str, SubmissionResult] = {}
 
     # Unfortunately must be before metadata, otherwise mypy gets confused about the type metadata.Metadata (feels like a bug)
     def _set_metadata(self, metadata: metadata.Metadata) -> None:  # Should only be called by ProblemConfig
@@ -2025,6 +3686,10 @@ class Problem(ProblemAspect):
         self.input_validators = InputValidators(self)
         self.output_validators = OutputValidators(self)
         self.graders = Graders(self)
+        self.static_validator = StaticValidator(self)
+        self.output_visualizer = OutputVisualizer(self)
+        self.input_visualizer = InputVisualizer(self)
+        self.validation_test_data = ValidationTestData(self)
         self.testdata = TestCaseGroup(self, os.path.join(self.probdir, 'data'))
         self.submissions = Submissions(self)
         self.loaded = True
@@ -2067,14 +3732,16 @@ class Problem(ProblemAspect):
                 'validators': [self.input_validators, self.output_validators],
                 'graders': [self.graders],
                 'data': [self.testdata],
+                'validation_test_data': [self.validation_test_data],
+                'visualizers': [self.static_validator, self.output_visualizer, self.input_visualizer],
                 'submissions': [self.submissions],
             }
             assert sorted(part_mapping.keys()) == sorted(PROBLEM_PARTS), 'part_mapping and PROBLEM_PARTS must be kept in sync'
 
             if not re.match('^[a-z0-9]+$', self.shortname):
                 self.error(f"Invalid shortname '{self.shortname}' (must be [a-z0-9]+)")
-            if self.format is FormatVersion.V_2023_07:
-                self.warning(f'Support for version {self.format} is very incomplete. Verification may not work as expected.')
+            if self.format is FormatVersion.V_2025_09:
+                self.info('Running in 2025-09 format mode')
 
             self._check_symlinks()
             self._check_file_and_directory_names()
@@ -2170,8 +3837,10 @@ class Problem(ProblemAspect):
                 if not regex.match(file) and not _special_case_allowed_files(file, reldir):
                     self.error(f"Invalid file name '{file}' in {reldir}, should match {regex.pattern}")
             for directory in dirs:
-                if not regex.match(directory) and not _special_case_allowed_dirs(directory, reldir):
-                    self.error(f"Invalid directory name '{directory}' in {reldir}, should match {regex.pattern}")
+                if not directory_regex.match(directory):
+                    self.error_in_2025_09(
+                        f"Invalid directory name '{directory}' in {reldir} (should match {directory_regex.pattern} ignoring case)"
+                    )
 
     def bail_on_error(self) -> bool:
         return self._args.bail_on_error

@@ -1,6 +1,7 @@
 import os.path
 import tempfile
 import shutil
+import yaml
 from pathlib import Path
 
 
@@ -63,6 +64,16 @@ class Template:
         else:
             self.samples = []
 
+        # If the statement uses \nextsample or \remainingsamples, skip
+        # template-level sample inclusion (the statement handles it).
+        if texfile.is_file():
+            try:
+                tex_content = texfile.read_text(encoding='utf-8')
+                if r'\nextsample' in tex_content or r'\remainingsamples' in tex_content:
+                    self.samples = []
+            except Exception:
+                pass
+
         problemset_cls_parent = problem_root.parent / 'problemset.cls'
         if not ignore_parent_cls and problemset_cls_parent.is_file():
             print(f'{problemset_cls_parent} exists, using it -- in case of weirdness this is likely culprit')
@@ -85,6 +96,10 @@ class Template:
                 'statement_filename': self.statement_filename,
                 'language': self.language,
             }
+
+            # Load constants from problem.yaml
+            constant_defs = self._load_constant_definitions()
+
             for line in templin:
                 try:
                     templout.write(line % data)
@@ -95,7 +110,36 @@ class Template:
                         templout.write(line % data)
                     if self.samples:
                         del data['sample']
+                # Inject constant definitions after \begin{document}
+                if r'\begin{document}' in line and constant_defs:
+                    templout.write(constant_defs)
         return self
+
+    def _load_constant_definitions(self) -> str:
+        """Generate \\defconstant LaTeX commands from problem.yaml constants."""
+        problem_yaml = self.problem_root / 'problem.yaml'
+        if not problem_yaml.is_file():
+            return ''
+        try:
+            with problem_yaml.open() as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            return ''
+        constants = data.get('constants', {})
+        if not constants:
+            return ''
+
+        lines = []
+        for name, value in constants.items():
+            if isinstance(value, dict):
+                for key, val in value.items():
+                    const_name = name if key == 'value' else f'{name}.{key}'
+                    lines.append(r'\defconstant{%s}{%s}' % (const_name, val))
+            else:
+                lines.append(r'\defconstant{%s}{%s}' % (name, value))
+                # Also define name.value for consistency
+                lines.append(r'\defconstant{%s.value}{%s}' % (name, value))
+        return '\n'.join(lines) + '\n'
 
     def __exit__(self, exc_type, exc_value, exc_traceback):
         if self._tempdir:

@@ -333,3 +333,120 @@ def format_interactive_sample(sample_root: str, sample: str, casenum: int, is_in
         sample_table += format_pass_content(pass_block)
 
     return sample_table
+
+# Regex pattern for {{name}} and {{name.variant}} constant tokens
+_CONSTANT_TOKEN_RE = re.compile(r'\{\{([a-zA-Z_][a-zA-Z0-9_]*)(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?\}\}')
+
+# Reserved {{}} tokens that are NOT constants (used for statement sample injection)
+_RESERVED_TOKENS = frozenset({'nextsample', 'remainingsamples'})
+
+
+def substitute_constants(text: str, constants: dict) -> tuple[str, set[str]]:
+    """Replace {{name}} and {{name.variant}} constant tokens in text.
+
+    Args:
+        text: The text to process.
+        constants: Dict mapping constant names to values. Values are either
+            scalars (int/float/str) or dicts with a 'value' key and optional
+            variant keys.
+
+    Returns:
+        Tuple of (substituted_text, set_of_undefined_references).
+        Undefined references are left as-is in the text.
+    """
+    undefined: set[str] = set()
+
+    def replacer(match: re.Match) -> str:
+        name = match.group(1)
+        variant = match.group(2)  # May be None
+        # Skip reserved tokens (e.g., {{nextsample}}, {{remainingsamples}})
+        if name in _RESERVED_TOKENS:
+            return match.group(0)
+        if name not in constants:
+            undefined.add(name)
+            return match.group(0)  # Leave as-is
+        value = constants[name]
+        if isinstance(value, dict):
+            key = variant or 'value'
+            if key not in value:
+                undefined.add(f'{name}.{key}')
+                return match.group(0)
+            return str(value[key])
+        else:
+            # Scalar constant
+            if variant is not None and variant != 'value':
+                undefined.add(f'{name}.{variant}')
+                return match.group(0)
+            return str(value)
+
+    result = _CONSTANT_TOKEN_RE.sub(replacer, text)
+    return result, undefined
+
+
+def substitute_constants_in_yaml(config: dict, constants: dict) -> tuple[dict, set[str]]:
+    """Substitute constant tokens in string values of a YAML config dict.
+
+    Recursively processes string values and list items. Non-string values
+    are left unchanged.
+
+    Returns:
+        Tuple of (substituted_config, set_of_undefined_references).
+    """
+    undefined: set[str] = set()
+
+    def _process(value):
+        if isinstance(value, str):
+            new_value, undef = substitute_constants(value, constants)
+            undefined.update(undef)
+            return new_value
+        elif isinstance(value, list):
+            return [_process(item) for item in value]
+        elif isinstance(value, dict):
+            return {k: _process(v) for k, v in value.items()}
+        return value
+
+    result = {k: _process(v) for k, v in config.items()}
+    return result, undefined
+
+
+def substitute_constants_in_file(filepath: str, constants: dict) -> set[str]:
+    """Substitute constants in a single file in-place.
+
+    Skips binary files (UnicodeDecodeError). Returns set of undefined references.
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except (UnicodeDecodeError, IOError):
+        return set()  # Skip binary files
+
+    new_text, undefined = substitute_constants(text, constants)
+    if new_text != text:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(new_text)
+    return undefined
+
+
+def substitute_constants_in_directory(directory: str, constants: dict) -> set[str]:
+    """Substitute constants in all files in a directory tree.
+
+    Walks the directory recursively and applies constant substitution
+    to all text files. Returns set of undefined references.
+    """
+    undefined: set[str] = set()
+    if not os.path.isdir(directory):
+        return undefined
+    for root, _dirs, files in os.walk(directory):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            undefined |= substitute_constants_in_file(fpath, constants)
+    return undefined
+
+
+def load_constants(problem_root: Path) -> dict:
+    """Load constants from problem.yaml.
+
+    Returns the constants dict (may be empty).
+    """
+    problem_metadata, _ = metadata.load_metadata(problem_root)
+    return problem_metadata.constants

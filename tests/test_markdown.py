@@ -4,7 +4,7 @@ import pytest
 from tests.test_xss import render, renderpdf
 from problemtools.statement_util import find_footnotes
 
-# TODO: add when guess is updated to 2023-07
+# TODO: add when guess is updated to 2025-09
 # def test_pdf_render():
 #     with tempfile.TemporaryDirectory() as temp_dir:
 #         problem_path = Path(__file__).parent / '..' / 'examples' / 'guess'
