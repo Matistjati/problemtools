@@ -26,8 +26,14 @@ import uuid
 import difflib
 from pathlib import Path
 
+import contextlib
 import colorlog
 import yaml
+from rich.table import Table
+from rich.console import Console
+from rich.live import Live
+from rich.text import Text
+from rich import box as rich_box
 
 from . import config
 from . import languages
@@ -111,6 +117,7 @@ class Context:
         self.data_filter: Pattern[str] = args.data_filter
         self.submission_filter: Pattern[str] = args.submission_filter
         self.fixed_timelim: float | None = args.fixed_timelim
+        self.show_subtask_scores: bool = getattr(args, 'score', False)
         self.executor = executor
         self._background_work: list[concurrent.futures.Future[object]] = []
 
@@ -754,8 +761,10 @@ class TestCaseGroup(ProblemAspect):
 
         runner.mark_group_done(self, broken)
 
+        res_main = self.aggregate_results(sub, subres)
+        runner.group_results[self] = res_main
         return (
-            self.aggregate_results(sub, subres),
+            res_main,
             self.aggregate_results(sub, subres_low, shadow_result=True),
             self.aggregate_results(sub, subres_high, shadow_result=True),
         )
@@ -1166,12 +1175,9 @@ class InputValidators(ProblemPart):
 
             def modified_input_validates(applicable, modifier):
                 for testcase in self.problem.testdata.get_all_testcases():
-                    try:
-                        with open(testcase.infile) as infile:
-                            infile_data = infile.read()
-                        if not applicable(infile_data):
-                            continue
-                    except UnicodeDecodeError:
+                    with open(testcase.infile) as infile:
+                        infile_data = infile.read()
+                    if not applicable(infile_data):
                         continue
 
                     with open(file_name, 'wb') as f:
@@ -1661,7 +1667,7 @@ class OutputValidators(ProblemPart):
 
 
 class Runner:
-    def __init__(self, problem: Problem, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float) -> None:
+    def __init__(self, problem: Problem, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float, subtask_table: SubtaskResultsTable | None = None) -> None:
         self._problem = problem
         self._sub = sub
         self._context = context
@@ -1669,7 +1675,9 @@ class Runner:
         self._timelim = timelim
         self._timelim_low = timelim_low
         self._timelim_high = timelim_high
+        self._subtask_table = subtask_table
         self._cache: dict[TestCase, TestCase.Result] = {}
+        self.group_results: dict[TestCaseGroup, SubmissionResult] = {}
         if self._multithreaded:
             self._queues: dict[TestCase, queue.Queue[TestCase.Result]] = {}
             self._lock = threading.Lock()
@@ -1696,9 +1704,11 @@ class Runner:
         if testcase in self._cache:
             return (self._cache[testcase], True)
 
-        if sys.stdout.isatty():
-            msg = f'Running {self._sub} on {testcase}...'
-            sys.stdout.write(msg)
+        progress_msg = f'Running {self._sub} on {testcase}...'
+        if self._subtask_table is not None:
+            self._subtask_table.set_status(progress_msg)
+        elif sys.stdout.isatty():
+            sys.stdout.write(progress_msg)
             sys.stdout.flush()
 
         if self._multithreaded:
@@ -1706,8 +1716,10 @@ class Runner:
         else:
             result = self._run_submission_real(testcase)
 
-        if sys.stdout.isatty():
-            sys.stdout.write('\b \b' * len(msg))
+        if self._subtask_table is not None:
+            self._subtask_table.clear_status()
+        elif sys.stdout.isatty():
+            sys.stdout.write('\b \b' * len(progress_msg))
 
         self._cache[testcase] = result
         return (result, False)
@@ -1733,12 +1745,10 @@ class Runner:
         if not item.matches_filter(self._context.data_filter):
             return []
         if isinstance(item, TestCase):
-            # If testcase is symlink, recursively follow the symlinks until we get a real testcase, ignoring
-            # whether the name of testcases pointed to matches the filter
-            while item.reuse_result_from:
-                item = item.reuse_result_from
-
-            return [item]
+            if item.reuse_result_from:
+                return self._gather_testcases(item.reuse_result_from)
+            else:
+                return [item]
         elif item not in self._done_groups:
             ret = []
             for child in item.get_testcases() + item.get_subgroups():
@@ -1767,6 +1777,153 @@ class Runner:
                     if testcase not in self._queues:
                         self._queues[testcase] = queue.Queue(maxsize=1)
             self._remaining_jobs.reverse()
+
+
+class SubtaskResultsTable:
+    """Live-updating table: one row per submission, one column per subtask.
+
+    Uses auto_refresh=False so the terminal is only redrawn when data actually
+    changes (new testcase started, new submission finished).  Between those
+    events the display is completely still, eliminating flicker.
+    The last testcase name is intentionally left in the caption until the next
+    one replaces it — "prefer outdated over nothing".
+    """
+
+    _VERDICT_STYLE: dict[str, str] = {
+        'AC': 'bold green',
+        'TLE': 'bold yellow',
+        'OLE': 'bold yellow',
+        'MLE': 'bold magenta',
+        'RTE': 'bold red',
+        'WA': 'bold red',
+        'PAC': 'bold cyan',
+        'JE': 'bold white on red',
+    }
+
+    _VERDICT_ICON: dict[str, str] = {
+        'AC': '\u2714',
+        'TLE': '\u23f1',
+        'OLE': '\U0001f4e4',
+        'MLE': '\U0001f4be',
+        'RTE': '\U0001f4a5',
+        'WA': '\u2718',
+        'PAC': '~',
+        'JE': '!',
+    }
+
+    def __init__(self, subtask_groups: list[TestCaseGroup], is_scoring: bool, show_subtask_scores: bool = False) -> None:
+        self._subtask_groups = subtask_groups
+        self._is_scoring = is_scoring
+        self._show_subtask_scores = show_subtask_scores
+        # Each entry: (sort_key, cells_list)
+        self._rows: list[tuple[float, list]] = []        
+        self._status: str = ''
+        # Cached rendered table; None means it must be rebuilt before next render.
+        self._cached_table: Table | None = None
+        # Logging handlers whose .stream we redirect on __enter__ and restore on __exit__.
+        self._saved_log_streams: dict[logging.StreamHandler, Any] = {}
+        self.console = Console()
+        self._live = Live(
+            self,
+            console=self.console,
+            auto_refresh=False,
+            redirect_stdout=True,   # intercept sys.stdout writes
+            redirect_stderr=True,   # intercept sys.stderr writes
+            vertical_overflow='visible',
+        )
+
+    # --- rich renderable protocol -----------------------------------------
+
+    def __rich_console__(self, console, options):  # type: ignore[override]
+        if self._cached_table is None:
+            self._cached_table = self._build_table()
+        if self._status:
+            self._cached_table.caption = Text(self._status, style='dim')
+        yield self._cached_table
+
+    def _build_table(self) -> Table:
+        table = Table(
+            title='Subtask Results',
+            box=rich_box.ROUNDED,
+            header_style='bold bright_cyan',
+            border_style='bright_black',
+            title_style='bold white',
+            show_lines=False,
+            expand=False,
+        )
+        table.add_column('Submission', style='bold white', no_wrap=True)
+        for group in self._subtask_groups:
+            table.add_column(os.path.basename(group._datadir), justify='center', no_wrap=True)
+        if self._is_scoring:
+            table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
+        sorted_rows = sorted(self._rows, key=lambda x: x[0], reverse=True)
+        for i, (_, cells) in enumerate(sorted_rows):
+            table.add_row(*cells, style='on grey7' if i % 2 else '')
+        return table
+
+    # --- public interface --------------------------------------------------
+
+    def set_status(self, msg: str) -> None:
+        """Show a progress message in the caption; triggers a redraw."""
+        self._status = msg
+        self._live.refresh()
+
+    def clear_status(self) -> None:
+        """No-op: keeps the last testcase name visible until the next one replaces it."""
+
+    def __enter__(self) -> SubtaskResultsTable:
+        self._live.__enter__()
+        # After Live has replaced sys.stdout/stderr with proxies that route
+        # writes through the Rich Console, redirect any logging StreamHandlers
+        # that still point at the original real stdout/stderr.  Without this,
+        # colorlog (and anything else using the captured stream reference)
+        # would write directly to the terminal fd, corrupting the cursor
+        # position tracking that the Live display relies on.
+        for handler in logging.root.handlers:
+            if (
+                isinstance(handler, logging.StreamHandler)
+                and not isinstance(handler, logging.FileHandler)
+                and sys.__stdout__ is not None
+                and handler.stream in (sys.__stdout__, sys.__stderr__)
+            ):
+                self._saved_log_streams[handler] = handler.stream
+                handler.stream = sys.stdout  # now the Live proxy
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        for handler, stream in self._saved_log_streams.items():
+            handler.stream = stream
+        self._saved_log_streams.clear()
+        self._live.__exit__(*args)
+
+    def _subtask_cell(self, res: SubmissionResult) -> Text:
+        verdict = res.verdict
+        style = self._VERDICT_STYLE.get(verdict, 'white')
+        if verdict == 'AC':
+            if self._show_subtask_scores:
+                score_str = f'{res.score:.2f}' if res.score is not None else ''
+                return Text.assemble((score_str, 'green'))
+            elif res.runtime >= 0:
+                return Text.assemble((f'{res.runtime:.2f}s', 'green'))
+        return Text(f'{verdict}', style=style)
+
+    def add_row(
+        self,
+        sub,
+        result: SubmissionResult,
+        group_results: dict[TestCaseGroup, SubmissionResult],
+    ) -> None:
+        sub_stem = sub.name
+        cells: list = [sub_stem]
+        for group in self._subtask_groups:
+            res = group_results.get(group)
+            cells.append(self._subtask_cell(res) if res is not None else Text('\u00b7', style='bright_black'))
+        if self._is_scoring:
+            cells.append(f'{result.score:.0f}' if result.score is not None else '\u2014')
+        sort_key = float(result.score) if result.score is not None else float('-inf')
+        self._rows.append((sort_key, cells))
+        self._cached_table = None   # invalidate; will be rebuilt on next render
+        self._live.refresh()
 
 
 class Submissions(ProblemPart):
@@ -1798,7 +1955,13 @@ class Submissions(ProblemPart):
         return 'submissions'
 
     def check_submission(
-        self, sub, context: Context, expected_verdict: Verdict, timelim: float, timelim_high: float
+        self,
+        sub,
+        context: Context,
+        expected_verdict: Verdict,
+        timelim: float,
+        timelim_high: float,
+        subtask_table: SubtaskResultsTable | None = None,
     ) -> SubmissionResult:
         desc = f'{expected_verdict} submission {sub}'
         partial = False
@@ -1812,8 +1975,9 @@ class Submissions(ProblemPart):
         else:
             timelim_low = timelim
 
-        with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high) as runner:
+        with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high, subtask_table) as runner:
             result, result_low, result_high = self.problem.testdata.run_submission(sub, runner, context)
+            group_results = runner.group_results
 
         if result.verdict == 'AC' and expected_verdict == 'AC' and not partial and result.sample_failures:
             res = result.sample_failures[0]
@@ -1832,14 +1996,19 @@ class Submissions(ProblemPart):
         if partial and self.fully_accepted(result):
             self.warning(f'{desc} got {result}')
         elif result.verdict == expected_verdict:
-            self.msg(f'   {desc} OK: {result}')
+            if subtask_table is None:
+                self.msg(f'   {desc} OK: {result}')
             if expected_verdict == 'AC' and not partial and not self.fully_accepted(result) and self.full_score_finite():
                 # For some heuristic problems, this is expected. Thus, only warn.
                 self.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
         elif result_high.verdict == expected_verdict and not (partial and self.fully_accepted(result_high)):
-            self.msg(f'   {desc} OK with extra time: {result_high}')
+            if subtask_table is None:
+                self.msg(f'   {desc} OK with extra time: {result_high}')
         else:
             self.error(f'{desc} got {result}', result_high.additional_info)
+
+        if subtask_table is not None:
+            subtask_table.add_row(sub, result, group_results)
 
         return result
 
@@ -1895,7 +2064,20 @@ class Submissions(ProblemPart):
         if limits.time_limit is not None and context.fixed_timelim is not None:
             self.warning('There is a fixed time limit in problem.yaml, and you provided one on command line. Using command line.')
 
-        for verdict in Submissions._VERDICTS:
+        secret_group = self.problem.testdata.get_subgroup('secret')
+        subtask_groups = secret_group.get_subgroups() if secret_group else []
+        # For scoring problems with no explicit subtask subgroups, treat the
+        # entire secret group as a single column named "secret".
+        if not subtask_groups and secret_group and self.problem.is_scoring():
+            subtask_groups = [secret_group]
+        _table_ctx: SubtaskResultsTable | contextlib.AbstractContextManager[None] = (
+            SubtaskResultsTable(subtask_groups, self.problem.is_scoring(), context.show_subtask_scores)
+            if subtask_groups
+            else contextlib.nullcontext()
+        )
+
+        with _table_ctx as results_table:
+          for verdict in Submissions._VERDICTS:
             acr = verdict[0]
             if verdict[2] and not self._submissions[acr]:
                 self.error(f'Require at least one "{verdict[1]}" submission')
@@ -1919,7 +2101,7 @@ class Submissions(ProblemPart):
                         continue
 
                     timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
-                    res = self.check_submission(sub, context, acr, timelim, timelim_high)
+                    res = self.check_submission(sub, context, acr, timelim, timelim_high, results_table)  # type: ignore[arg-type]
                     runtimes.append(res.runtime)
 
             if acr == 'AC':
@@ -1937,11 +2119,13 @@ class Submissions(ProblemPart):
                         )
                     tl_from_subs, _ = self._compute_time_limit(None, lower_bound_runtime)
                     if not math.isclose(fixed_limit, tl_from_subs):
-                        self.msg(
-                            f'   Solutions give timelim of {_f_n(tl_from_subs)} seconds, but will use provided fixed limit of {_f_n(fixed_limit)} seconds instead'
-                        )
+                        if results_table is None:
+                            self.msg(
+                                f'   Solutions give timelim of {_f_n(tl_from_subs)} seconds, but will use provided fixed limit of {_f_n(fixed_limit)} seconds instead'
+                            )
 
                 timelim, timelim_margin = self._compute_time_limit(fixed_limit, lower_bound_runtime)
+            
                 self.msg(
                     f'   Slowest AC runtime: {_f_n(lower_bound_runtime)}, setting timelim to {_f_n(timelim)} secs, safety margin to {_f_n(timelim_margin)} secs'
                 )
@@ -2206,6 +2390,11 @@ def argparser_basic_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('-b', '--bail_on_error', action='store_true', help='bail verification on first error')
     parser.add_argument('-l', '--log_level', default='warning', help='set log level (debug, info, warning, error, critical)')
     parser.add_argument('-e', '--werror', action='store_true', help='consider warnings as errors')
+    parser.add_argument(
+        '--score',
+        action='store_true',
+        help='in the subtask results table, show score per subtask instead of runtime for accepted groups',
+    )
     parser.add_argument(
         '--max_additional_info',
         type=int,
