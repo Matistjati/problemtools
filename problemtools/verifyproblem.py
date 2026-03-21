@@ -11,6 +11,7 @@ import queue
 import glob
 import string
 import hashlib
+import json
 import collections
 import os
 import signal
@@ -118,7 +119,9 @@ class Context:
         self.submission_filter: Pattern[str] = args.submission_filter
         self.fixed_timelim: float | None = args.fixed_timelim
         self.show_subtask_scores: bool = getattr(args, 'score', False)
+        self.use_cache: bool = getattr(args, 'cache', False)
         self.executor = executor
+        self.validation_executor: ThreadPoolExecutor | None = None
         self._background_work: list[concurrent.futures.Future[object]] = []
 
     def submit_background_work(self, job: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> None:
@@ -201,12 +204,14 @@ class ProblemAspect(ABC):
     def _add_error(self) -> None:
         self.errors += 1
         if self.problem is not self:
-            self.problem._add_error()
+            with self.problem._counter_lock:
+                self.problem.errors += 1
 
     def _add_warning(self) -> None:
         self.warnings += 1
         if self.problem is not self:
-            self.problem._add_warning()
+            with self.problem._counter_lock:
+                self.problem.warnings += 1
 
 
 class ProblemPart(ProblemAspect):
@@ -729,9 +734,24 @@ class TestCaseGroup(ProblemAspect):
                 self.warning(f"Test data group '{last_testgroup_name}' will be ordered before '{name}'; consider zero-padding")
             last_testgroup_name = name
 
-        for child in self._items:
-            if child.matches_filter(context.data_filter):
-                child.check(context)
+        testcases = [c for c in self._items if isinstance(c, TestCase) and c.matches_filter(context.data_filter)]
+        groups = [c for c in self._items if isinstance(c, TestCaseGroup) and c.matches_filter(context.data_filter)]
+
+        if context.validation_executor is not None and len(testcases) > 1:
+            futures = [context.validation_executor.submit(tc.check, context) for tc in testcases]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except VerifyError as e:
+                    for f in futures:
+                        f.cancel()
+                    raise
+        else:
+            for tc in testcases:
+                tc.check(context)
+
+        for group in groups:
+            group.check(context)
 
         return self._check_res
 
@@ -1666,8 +1686,151 @@ class OutputValidators(ProblemPart):
         return res
 
 
+class ResultCache:
+    """Cross-run cache for single-testcase execution results.
+
+    Stores results keyed by a SHA-256 digest of every factor that affects
+    execution outcome: solution source, input/answer file content, output
+    validator source, validator flags, memory limit, and language.
+
+    Time limit is NOT part of the key.  Instead, the cached runtime is
+    compared against the current time limit to decide whether the cached
+    entry is still valid:
+      - Non-TLE verdict: valid when cached_runtime <= current timelim_high
+      - TLE verdict:     valid when cached timelim_high >= current timelim_high
+    """
+
+    _CACHE_DIR = '/tmp/problemtools/cache'
+
+    def __init__(self) -> None:
+        os.makedirs(self._CACHE_DIR, exist_ok=True)
+        self._file_hashes: dict[str, str] = {}
+
+    # -- hashing helpers ---------------------------------------------------
+
+    def _hash_file_content(self, path: str) -> str:
+        """SHA-256 hex digest of file content, memoised per path."""
+        digest = self._file_hashes.get(path)
+        if digest is None:
+            h = hashlib.sha256()
+            with open(path, 'rb') as f:
+                while chunk := f.read(65536):
+                    h.update(chunk)
+            digest = h.hexdigest()
+            self._file_hashes[path] = digest
+        return digest
+
+    def _make_key(self, sub: run.SourceCode, testcase: TestCase, problem: Problem) -> str:
+        h = hashlib.sha256()
+
+        # Submission source + language
+        h.update(b'lang:')
+        h.update(sub.language.lang_id.encode())
+        for src_file in sorted(sub.src):
+            h.update(os.path.basename(src_file).encode())
+            h.update(self._hash_file_content(src_file).encode())
+
+        # Input file
+        h.update(b'\x00in:')
+        h.update(self._hash_file_content(testcase.infile).encode())
+
+        # Answer file
+        h.update(b'\x00ans:')
+        h.update(self._hash_file_content(testcase.ansfile).encode())
+
+        # Output validator identity
+        h.update(b'\x00val:')
+        if problem.output_validators.uses_default_validator():
+            h.update(b'default')
+        else:
+            for val in problem.output_validators._validators:
+                if hasattr(val, 'src'):
+                    for src_file in sorted(val.src):
+                        h.update(os.path.basename(src_file).encode())
+                        h.update(self._hash_file_content(src_file).encode())
+
+        # Validator flags (legacy global + per-group)
+        h.update(b'\x00vflags:')
+        flags = (
+            problem.metadata.legacy_validator_flags
+            + '\x00'
+            + testcase.testcasegroup.config['output_validator_flags']
+        )
+        h.update(flags.encode())
+
+        # Memory limit (exact match)
+        h.update(b'\x00memlim:')
+        h.update(str(problem.metadata.limits.memory).encode())
+
+        return h.hexdigest()
+
+    # -- public API --------------------------------------------------------
+
+    def lookup(
+        self, sub: run.SourceCode, testcase: TestCase, problem: Problem, timelim_high: float,
+    ) -> SubmissionResult | None:
+        key = self._make_key(sub, testcase, problem)
+        path = os.path.join(self._CACHE_DIR, f'{key}.json')
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+
+        cached_verdict: str = data['verdict']
+        cached_runtime: float = data['runtime']
+        cached_timelim: float = data['timelim_high']
+
+        # Time-limit reuse logic
+        if cached_verdict == 'TLE':
+            # TLE at cached_timelim → still TLE at any shorter/equal limit.
+            # With *more* time the submission might succeed → miss.
+            if cached_timelim < timelim_high:
+                return None
+        else:
+            # Process completed.  Valid only when the process would finish
+            # before the current time limit (if runtime > timelim_high the
+            # OS might kill it at a different point producing different output).
+            if cached_runtime > timelim_high:
+                return None
+
+        res = SubmissionResult(
+            cached_verdict,
+            score=data.get('score'),
+            reason=data.get('reason'),
+            additional_info=data.get('additional_info'),
+        )
+        res.runtime = cached_runtime
+        return res
+
+    def store(
+        self, sub: run.SourceCode, testcase: TestCase, problem: Problem,
+        timelim_high: float, res_high: SubmissionResult,
+    ) -> None:
+        key = self._make_key(sub, testcase, problem)
+        data = {
+            'verdict': res_high.verdict,
+            'runtime': res_high.runtime,
+            'score': res_high.score,
+            'reason': res_high.reason,
+            'additional_info': res_high.additional_info,
+            'timelim_high': timelim_high,
+        }
+        path = os.path.join(self._CACHE_DIR, f'{key}.json')
+        tmp = f'{path}.tmp.{os.getpid()}'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(data, f)
+            os.replace(tmp, path)  # atomic on same filesystem
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 class Runner:
-    def __init__(self, problem: Problem, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float, subtask_table: SubtaskResultsTable | None = None) -> None:
+    def __init__(self, problem: Problem, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float, subtask_table: SubtaskResultsTable | None = None, result_cache: ResultCache | None = None) -> None:
         self._problem = problem
         self._sub = sub
         self._context = context
@@ -1676,6 +1839,7 @@ class Runner:
         self._timelim_low = timelim_low
         self._timelim_high = timelim_high
         self._subtask_table = subtask_table
+        self._result_cache = result_cache
         self._cache: dict[TestCase, TestCase.Result] = {}
         self.group_results: dict[TestCaseGroup, SubmissionResult] = {}
         if self._multithreaded:
@@ -1733,7 +1897,49 @@ class Runner:
                 self._recompute_jobs()
 
     def _run_submission_real(self, item: TestCase) -> TestCase.Result:
-        return item.run_submission_real(self._sub, self._context, self._timelim, self._timelim_low, self._timelim_high)
+        # Cross-run cache: skip execution when a valid cached result exists.
+        # Interactive problems are not cached because the validator/submission
+        # pipe interaction makes runtime semantics more complex.
+        cacheable = self._result_cache is not None and not self._problem.is_interactive()
+        if cacheable:
+            assert self._result_cache is not None
+            cached = self._result_cache.lookup(
+                self._sub, item, self._problem, self._timelim_high,
+            )
+            if cached is not None:
+                return self._bucket_by_timelim(cached)
+
+        result = item.run_submission_real(self._sub, self._context, self._timelim, self._timelim_low, self._timelim_high)
+
+        if cacheable:
+            assert self._result_cache is not None
+            res_high = result[2]  # third element is the raw res_high
+            self._result_cache.store(
+                self._sub, item, self._problem, self._timelim_high, res_high,
+            )
+
+        return result
+
+    def _bucket_by_timelim(self, res_high: SubmissionResult) -> TestCase.Result:
+        """Derive (res, res_low, res_high) from a raw execution result.
+
+        Mirrors the timelim bucketing logic in TestCase.run_submission_real.
+        """
+        if res_high.runtime <= self._timelim_low:
+            res_low = res_high
+            res = res_high
+        elif res_high.runtime <= self._timelim:
+            res_low = SubmissionResult('TLE')
+            res = res_high
+        else:
+            res_low = SubmissionResult('TLE')
+            res = res_low
+        res.runtime = res_high.runtime
+        res_low.runtime = res_high.runtime
+        res.set_ac_runtime()
+        res_low.set_ac_runtime()
+        res_high.set_ac_runtime()
+        return (res, res_low, res_high)
 
     def _work(self) -> None:
         item = self._next_job()
@@ -1811,12 +2017,15 @@ class SubtaskResultsTable:
         'JE': '!',
     }
 
-    def __init__(self, subtask_groups: list[TestCaseGroup], is_scoring: bool, show_subtask_scores: bool = False) -> None:
+    _CATEGORY_ORDER: list[str] = ['AC', 'PAC', 'WA', 'RTE', 'TLE']
+
+    def __init__(self, subtask_groups: list[TestCaseGroup], is_scoring: bool, problem_name: str = '', show_subtask_scores: bool = False) -> None:
         self._subtask_groups = subtask_groups
         self._is_scoring = is_scoring
+        self._problem_name = problem_name
         self._show_subtask_scores = show_subtask_scores
-        # Each entry: (sort_key, cells_list)
-        self._rows: list[tuple[float, list]] = []        
+        # Each entry: (category, sort_key, cells_list)
+        self._rows: list[tuple[str, float, list]] = []        
         self._status: str = ''
         # Cached rendered table; None means it must be rebuilt before next render.
         self._cached_table: Table | None = None
@@ -1842,8 +2051,14 @@ class SubtaskResultsTable:
         yield self._cached_table
 
     def _build_table(self) -> Table:
+        if self._show_subtask_scores and self._problem_name:
+            title = f'{self._problem_name} raw scores'
+        elif self._problem_name:
+            title = self._problem_name
+        else:
+            title = 'Subtask Results'
         table = Table(
-            title='Subtask Results',
+            title=title,
             box=rich_box.ROUNDED,
             header_style='bold bright_cyan',
             border_style='bright_black',
@@ -1856,9 +2071,20 @@ class SubtaskResultsTable:
             table.add_column(os.path.basename(group._datadir), justify='center', no_wrap=True)
         if self._is_scoring:
             table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
-        sorted_rows = sorted(self._rows, key=lambda x: x[0], reverse=True)
-        for i, (_, cells) in enumerate(sorted_rows):
-            table.add_row(*cells, style='on grey7' if i % 2 else '')
+        # Group rows by category (in defined order), sort within group by score desc.
+        by_category: dict[str, list[tuple[float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
+        for cat, score, cells in self._rows:
+            by_category.setdefault(cat, []).append((score, cells))
+        groups_present = [cat for cat in self._CATEGORY_ORDER if by_category.get(cat)]
+        row_index = 0
+        for g_idx, cat in enumerate(groups_present):
+            cat_rows = sorted(by_category[cat], key=lambda x: x[0], reverse=True)
+            last_in_group = len(cat_rows) - 1
+            is_last_group = g_idx == len(groups_present) - 1
+            for r_idx, (_, cells) in enumerate(cat_rows):
+                end_section = (r_idx == last_in_group) and not is_last_group
+                table.add_row(*cells, style='on grey7' if row_index % 2 else '', end_section=end_section)
+                row_index += 1
         return table
 
     # --- public interface --------------------------------------------------
@@ -1912,6 +2138,7 @@ class SubtaskResultsTable:
         sub,
         result: SubmissionResult,
         group_results: dict[TestCaseGroup, SubmissionResult],
+        category: str = 'AC',
     ) -> None:
         sub_stem = sub.name
         cells: list = [sub_stem]
@@ -1921,7 +2148,7 @@ class SubtaskResultsTable:
         if self._is_scoring:
             cells.append(f'{result.score:.0f}' if result.score is not None else '\u2014')
         sort_key = float(result.score) if result.score is not None else float('-inf')
-        self._rows.append((sort_key, cells))
+        self._rows.append((category, sort_key, cells))
         self._cached_table = None   # invalidate; will be rebuilt on next render
         self._live.refresh()
 
@@ -1962,7 +2189,9 @@ class Submissions(ProblemPart):
         timelim: float,
         timelim_high: float,
         subtask_table: SubtaskResultsTable | None = None,
+        result_cache: ResultCache | None = None,
     ) -> SubmissionResult:
+        category = expected_verdict  # preserve before possible 'PAC' → 'AC' change
         desc = f'{expected_verdict} submission {sub}'
         partial = False
         if expected_verdict == 'PAC':
@@ -1975,7 +2204,7 @@ class Submissions(ProblemPart):
         else:
             timelim_low = timelim
 
-        with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high, subtask_table) as runner:
+        with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high, subtask_table, result_cache) as runner:
             result, result_low, result_high = self.problem.testdata.run_submission(sub, runner, context)
             group_results = runner.group_results
 
@@ -2008,7 +2237,7 @@ class Submissions(ProblemPart):
             self.error(f'{desc} got {result}', result_high.additional_info)
 
         if subtask_table is not None:
-            subtask_table.add_row(sub, result, group_results)
+            subtask_table.add_row(sub, result, group_results, category)
 
         return result
 
@@ -2071,10 +2300,12 @@ class Submissions(ProblemPart):
         if not subtask_groups and secret_group and self.problem.is_scoring():
             subtask_groups = [secret_group]
         _table_ctx: SubtaskResultsTable | contextlib.AbstractContextManager[None] = (
-            SubtaskResultsTable(subtask_groups, self.problem.is_scoring(), context.show_subtask_scores)
+            SubtaskResultsTable(subtask_groups, self.problem.is_scoring(), self.problem.shortname, context.show_subtask_scores)
             if subtask_groups
             else contextlib.nullcontext()
         )
+
+        result_cache = ResultCache() if context.use_cache else None
 
         with _table_ctx as results_table:
           for verdict in Submissions._VERDICTS:
@@ -2101,7 +2332,7 @@ class Submissions(ProblemPart):
                         continue
 
                     timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
-                    res = self.check_submission(sub, context, acr, timelim, timelim_high, results_table)  # type: ignore[arg-type]
+                    res = self.check_submission(sub, context, acr, timelim, timelim_high, results_table, result_cache)  # type: ignore[arg-type]
                     runtimes.append(res.runtime)
 
             if acr == 'AC':
@@ -2150,6 +2381,7 @@ class Problem(ProblemAspect):
         self._metadata: metadata.Metadata | None = None
         self._args = args
         self._timelim: float | None = None
+        self._counter_lock = threading.Lock()
 
     # Unfortunately must be before metadata, otherwise mypy gets confused about the type metadata.Metadata (feels like a bug)
     def _set_metadata(self, metadata: metadata.Metadata) -> None:  # Should only be called by ProblemConfig
@@ -2248,6 +2480,7 @@ class Problem(ProblemAspect):
 
         executor = ThreadPoolExecutor(self._args.threads) if self._args.threads > 1 else None
         context = Context(self._args, executor)
+        context.validation_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
         try:
             part_mapping: dict[str, list] = {
@@ -2289,7 +2522,36 @@ class Problem(ProblemAspect):
             # Wait for background work to finish before performing an rmtree on
             # the directory tree it uses.
             context.wait_for_background_work()
-        return self.errors, self.warnings
+        if context.validation_executor is not None:
+            context.validation_executor.shutdown(wait=True)
+        submission_directories = [p.name for p in (Path(self.probdir) / 'submissions').glob('*') if p.is_dir()]
+        if len(submission_directories) == 0:
+            return
+
+        def most_similar(present_dir: str, format_version: FormatVersion):
+            similarities = [
+                (spec_dir, difflib.SequenceMatcher(None, present_dir, spec_dir).ratio())
+                for spec_dir in format_version.submission_directories
+            ]
+            return max(similarities, key=lambda x: x[1])
+
+        for present_dir in submission_directories:
+            most_similar_dir, max_similarity = most_similar(present_dir, self.format)
+
+            if max_similarity == 1:
+                # Exact match, no typo
+                continue
+
+            if 0.75 <= max_similarity:
+                self.warning(f'Potential typo: directory submissions/{present_dir} is similar to {most_similar_dir}')
+            else:
+                for other_version in [v for v in FormatVersion if v != self.format]:
+                    _, max_similarity = most_similar(present_dir, other_version)
+                    if max_similarity == 1:
+                        self.warning(
+                            f'Directory submissions/{present_dir} is not part of format version {self.format}, but part of {other_version}'
+                        )
+                        break
 
     def _check_submission_directory_names(self):
         """Heuristically check if submissions contain any directories that will be ignored because of typos or format mismatches"""
@@ -2394,6 +2656,11 @@ def argparser_basic_arguments(parser: argparse.ArgumentParser) -> None:
         '--score',
         action='store_true',
         help='in the subtask results table, show score per subtask instead of runtime for accepted groups',
+    )
+    parser.add_argument(
+        '--cache',
+        action='store_true',
+        help='cache testcase results across runs in /tmp/problemtools/ to speed up repeated verification',
     )
     parser.add_argument(
         '--max_additional_info',
