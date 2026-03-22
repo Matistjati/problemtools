@@ -2522,36 +2522,9 @@ class Problem(ProblemAspect):
             # Wait for background work to finish before performing an rmtree on
             # the directory tree it uses.
             context.wait_for_background_work()
-        if context.validation_executor is not None:
-            context.validation_executor.shutdown(wait=True)
-        submission_directories = [p.name for p in (Path(self.probdir) / 'submissions').glob('*') if p.is_dir()]
-        if len(submission_directories) == 0:
-            return
-
-        def most_similar(present_dir: str, format_version: FormatVersion):
-            similarities = [
-                (spec_dir, difflib.SequenceMatcher(None, present_dir, spec_dir).ratio())
-                for spec_dir in format_version.submission_directories
-            ]
-            return max(similarities, key=lambda x: x[1])
-
-        for present_dir in submission_directories:
-            most_similar_dir, max_similarity = most_similar(present_dir, self.format)
-
-            if max_similarity == 1:
-                # Exact match, no typo
-                continue
-
-            if 0.75 <= max_similarity:
-                self.warning(f'Potential typo: directory submissions/{present_dir} is similar to {most_similar_dir}')
-            else:
-                for other_version in [v for v in FormatVersion if v != self.format]:
-                    _, max_similarity = most_similar(present_dir, other_version)
-                    if max_similarity == 1:
-                        self.warning(
-                            f'Directory submissions/{present_dir} is not part of format version {self.format}, but part of {other_version}'
-                        )
-                        break
+            if context.validation_executor is not None:
+                context.validation_executor.shutdown(wait=True)
+        return self.errors, self.warnings
 
     def _check_submission_directory_names(self):
         """Heuristically check if submissions contain any directories that will be ignored because of typos or format mismatches"""
