@@ -1,3 +1,3 @@
-more multithreading (benchmark and see where biggest gain is)
-cache results
+in subtask tables, show sample
+in sutbask tables, show how much each group is worth?
 debug mode
