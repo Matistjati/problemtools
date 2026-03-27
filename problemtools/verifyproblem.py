@@ -80,6 +80,9 @@ class SubmissionResult:
         self.ac_runtime_testcase: TestCase | None = None
         self.validator_first = False
         self.sample_failures: list[SubmissionResult] = []
+        self.first_failure: TestCase | None = None
+        self.first_failure_verdict: str | None = None
+        self.group_results: dict[TestCaseGroup, SubmissionResult] | None = None
 
     def set_ac_runtime(self) -> None:
         if self.verdict == 'AC':
@@ -120,6 +123,7 @@ class Context:
         self.fixed_timelim: float | None = args.fixed_timelim
         self.show_subtask_scores: bool = getattr(args, 'score', False)
         self.use_cache: bool = getattr(args, 'cache', False)
+        self.debug_mode: bool = getattr(args, 'debug', False)
         self.executor = executor
         self.validation_executor: ThreadPoolExecutor | None = None
         self._background_work: list[concurrent.futures.Future[object]] = []
@@ -799,6 +803,9 @@ class TestCaseGroup(ProblemAspect):
             if r.ac_runtime > res.ac_runtime:
                 res.ac_runtime = r.ac_runtime
                 res.ac_runtime_testcase = r.ac_runtime_testcase
+            if r.verdict != 'AC' and res.first_failure is None:
+                res.first_failure = r.testcase
+                res.first_failure_verdict = r.verdict
             res.sample_failures.extend(r.sample_failures)
 
         judge_error = next((r for r in sub_results if r.verdict == 'JE'), None)
@@ -2025,6 +2032,7 @@ class SubtaskResultsTable:
         self._subtask_groups = subtask_groups
         self._is_scoring = is_scoring
         self._problem_name = problem_name
+        self._timelim: float | None = None
         self._show_subtask_scores = show_subtask_scores
         # Each entry: (category, sort_key, cells_list)
         self._rows: list[tuple[str, float, list]] = []        
@@ -2053,10 +2061,11 @@ class SubtaskResultsTable:
         yield self._cached_table
 
     def _build_table(self) -> Table:
+        tl_suffix = f' @ {self._timelim:g}s time limit' if self._timelim is not None else ''
         if self._show_subtask_scores and self._problem_name:
-            title = f'{self._problem_name} raw scores'
+            title = f'{self._problem_name} raw scores{tl_suffix}'
         elif self._problem_name:
-            title = self._problem_name
+            title = f'{self._problem_name}{tl_suffix}'
         else:
             title = 'Subtask Results'
         table = Table(
@@ -2094,6 +2103,12 @@ class SubtaskResultsTable:
     def set_status(self, msg: str) -> None:
         """Show a progress message in the caption; triggers a redraw."""
         self._status = msg
+        self._live.refresh()
+
+    def set_timelim(self, timelim: float) -> None:
+        """Update the title with the computed time limit and force a redraw."""
+        self._timelim = timelim
+        self._cached_table = None
         self._live.refresh()
 
     def clear_status(self) -> None:
@@ -2227,19 +2242,22 @@ class Submissions(ProblemPart):
         if partial and self.fully_accepted(result):
             self.warning(f'{desc} got {result}')
         elif result.verdict == expected_verdict:
-            if subtask_table is None:
+            if subtask_table is None and not context.debug_mode:
                 self.msg(f'   {desc} OK: {result}')
             if expected_verdict == 'AC' and not partial and not self.fully_accepted(result) and self.full_score_finite():
                 # For some heuristic problems, this is expected. Thus, only warn.
                 self.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
         elif result_high.verdict == expected_verdict and not (partial and self.fully_accepted(result_high)):
-            if subtask_table is None:
+            if subtask_table is None and not context.debug_mode:
                 self.msg(f'   {desc} OK with extra time: {result_high}')
         else:
             self.error(f'{desc} got {result}', result_high.additional_info)
 
         if subtask_table is not None:
             subtask_table.add_row(sub, result, group_results, category)
+
+        if context.debug_mode:
+            result.group_results = dict(group_results)
 
         return result
 
@@ -2254,6 +2272,74 @@ class Submissions(ProblemPart):
         min_score, max_score = self.problem.testdata.get_score_range()
         best_score = min_score if self.problem.metadata.legacy_grading.objective == 'min' else max_score
         return result.verdict == 'AC' and (not self.problem.is_scoring() or result.score == best_score)
+
+    def _print_debug_summary(
+        self,
+        debug_data: list[tuple[str, str, SubmissionResult]],
+        subtask_groups: list[TestCaseGroup],
+    ) -> None:
+        def compact_path(tc: TestCase) -> str:
+            path = tc.strip_path_prefix(tc._base)
+            if path.startswith('secret/'):
+                path = path[7:]
+            return path
+
+        console = Console()
+        vstyles = SubtaskResultsTable._VERDICT_STYLE
+
+        entries: list[tuple[str, str, SubmissionResult, list[tuple[TestCaseGroup, SubmissionResult]]]] = []
+        for sub_name, category, result in debug_data:
+            if result.group_results is None:
+                continue
+            fail_groups = []
+            if subtask_groups:
+                for g in subtask_groups:
+                    gr = result.group_results.get(g)
+                    if gr and gr.verdict != 'AC':
+                        fail_groups.append((g, gr))
+            has_failure = bool(fail_groups) or result.verdict != 'AC'
+            if not has_failure:
+                continue
+            entries.append((sub_name, category, result, fail_groups))
+
+        if not entries:
+            console.print('\n  [bold green]\u2714[/bold green] [green]All solutions behaved as expected[/green]\n')
+            return
+
+        console.print()
+        console.rule('[bold red]Failures[/bold red]', style='bright_black')
+
+        for sub_name, category, result, fail_groups in entries:
+            console.print()
+            cat_style = vstyles.get(category, 'white')
+            header = f'  [bold red]\u2718[/bold red] [bold white]{sub_name}[/bold white]  [{cat_style}]{category}[/{cat_style}]'
+            if category != result.verdict:
+                res_style = vstyles.get(result.verdict, 'white')
+                header += f' [dim]\u2192[/dim] [{res_style}]{result.verdict}[/{res_style}]'
+            console.print(header)
+
+            if fail_groups:
+                max_gname = max(len(os.path.basename(g._datadir)) for g, _ in fail_groups)
+                for group, gr in fail_groups:
+                    gname = os.path.basename(group._datadir)
+                    verdict = gr.verdict
+                    vs = vstyles.get(verdict, 'white')
+                    tc = gr.first_failure or gr.testcase
+                    tc_name = os.path.basename(tc._base) if tc else '?'
+                    console.print(f'    {gname:<{max_gname}}  [{vs}]{verdict:<4}[/{vs}] [dim]@[/dim] [dim]{tc_name}[/dim]')
+            elif result.verdict != 'AC':
+                tc = result.first_failure or result.testcase
+                tc_name = compact_path(tc) if tc else '?'
+                vs = vstyles.get(result.verdict, 'white')
+                console.print(f'    [{vs}]{result.verdict}[/{vs}] [dim]@ {tc_name}[/dim]')
+
+            if result.runtime >= 0 and result.runtime_testcase:
+                tc_path = compact_path(result.runtime_testcase)
+                console.print(f'    [dim]\u23f1 {result.runtime:.2f} @ {tc_path}[/dim]')
+
+        console.print()
+        console.rule(style='bright_black')
+        console.print()
 
     def start_background_work(self, context: Context) -> None:
         # Send off an early background compile job for each submission and
@@ -2296,18 +2382,21 @@ class Submissions(ProblemPart):
             self.warning('There is a fixed time limit in problem.yaml, and you provided one on command line. Using command line.')
 
         secret_group = self.problem.testdata.get_subgroup('secret')
+        sample_group = self.problem.testdata.get_subgroup('sample')
         subtask_groups = secret_group.get_subgroups() if secret_group else []
         # For scoring problems with no explicit subtask subgroups, treat the
         # entire secret group as a single column named "secret".
         if not subtask_groups and secret_group and self.problem.is_scoring():
             subtask_groups = [secret_group]
+        table_groups = ([sample_group] if sample_group else []) + subtask_groups
         _table_ctx: SubtaskResultsTable | contextlib.AbstractContextManager[None] = (
-            SubtaskResultsTable(subtask_groups, self.problem.is_scoring(), self.problem.shortname, context.show_subtask_scores)
-            if subtask_groups
+            SubtaskResultsTable(table_groups, self.problem.is_scoring(), self.problem.shortname, context.show_subtask_scores)
+            if table_groups
             else contextlib.nullcontext()
         )
 
         result_cache = ResultCache() if context.use_cache else None
+        debug_data: list[tuple[str, str, SubmissionResult]] = []
 
         with _table_ctx as results_table:
           for verdict in Submissions._VERDICTS:
@@ -2336,6 +2425,8 @@ class Submissions(ProblemPart):
                     timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
                     res = self.check_submission(sub, context, acr, timelim, timelim_high, results_table, result_cache)  # type: ignore[arg-type]
                     runtimes.append(res.runtime)
+                    if context.debug_mode:
+                        debug_data.append((sub.name, acr, res))
 
             if acr == 'AC':
                 if len(runtimes) > 0:
@@ -2363,6 +2454,11 @@ class Submissions(ProblemPart):
                     f'   Slowest AC runtime: {_f_n(lower_bound_runtime)}, setting timelim to {_f_n(timelim)} secs, safety margin to {_f_n(timelim_margin)} secs'
                 )
                 self.problem._set_timelim(timelim)
+                if results_table is not None:
+                    results_table.set_timelim(timelim)
+
+        if context.debug_mode and debug_data:
+            self._print_debug_summary(debug_data, subtask_groups)
 
         return self._check_res
 
@@ -2636,6 +2732,11 @@ def argparser_basic_arguments(parser: argparse.ArgumentParser) -> None:
         '--cache',
         action='store_true',
         help='cache testcase results across runs in /tmp/problemtools/ to speed up repeated verification',
+    )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='compact output showing only failures with first failing testcase per group and slowest testcase',
     )
     parser.add_argument(
         '--max_additional_info',
