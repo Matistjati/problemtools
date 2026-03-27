@@ -49,7 +49,10 @@ def try_limit(limit, soft, hard):
         soft = cur_hard
     if not __limit_less(hard, cur_hard):
         hard = cur_hard
-    resource.setrlimit(limit, (soft, hard))
+    try:
+        resource.setrlimit(limit, (soft, hard))
+    except (ValueError, OSError):
+        pass
 
 
 def __limit_less(lim1, lim2):
