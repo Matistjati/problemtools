@@ -3,32 +3,24 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import math
-import threading
-import queue
 import glob
 import string
 import hashlib
-import json
 import collections
+import concurrent.futures
 import os
-import signal
 import re
 import shutil
 import logging
 import tempfile
 import sys
-import copy
 import random
 import traceback
 import uuid
 import difflib
 from pathlib import Path
 
-import contextlib
-import colorlog
 import yaml
 from rich.table import Table
 from rich.console import Console
@@ -43,155 +35,64 @@ from . import problem2html
 from . import problem2pdf
 from . import run
 from . import statement_util
+from .context import Context, PROBLEM_PARTS
+from .diagnostics import Diagnostics, LoggingDiagnostics, VerifyError
 from .formatversion import FormatVersion, get_format_version
+from .judge import CacheKey, SubmissionJudge, SubmissionResult, Verdict, validate_output
 from .version import add_version_arg
 
 from abc import ABC
-from typing import Any, Callable, ClassVar, Literal, Pattern, Match, ParamSpec, TypeVar, cast
+from functools import cached_property
+from typing import Any, Callable, ClassVar, Literal, Pattern, Match, ParamSpec, TypeVar
 from pydantic import ValidationError
 
 random.seed(42)
-
-log = logging.getLogger(__name__)
-
-Verdict = Literal['AC', 'TLE', 'OLE', 'MLE', 'RTE', 'WA', 'PAC', 'JE']
-
-
-def is_TLE(status: int, may_signal_with_usr1: bool = False) -> bool:
-    return os.WIFSIGNALED(status) and (
-        os.WTERMSIG(status) == signal.SIGXCPU or (may_signal_with_usr1 and os.WTERMSIG(status) == signal.SIGUSR1)
-    )
-
-
-def is_RTE(status: int) -> bool:
-    return not os.WIFEXITED(status) or bool(os.WEXITSTATUS(status))
-
-
-class SubmissionResult:
-    def __init__(self, verdict: str, score: float | None = None, reason: str | None = None, additional_info: str | None = None):
-        self.verdict = verdict
-        self.score = score
-        self.reason = reason
-        self.additional_info = additional_info
-        self.testcase: TestCase | None = None
-        self.runtime_testcase: TestCase | None = None
-        self.runtime = -1.0
-        self.ac_runtime = -1.0
-        self.ac_runtime_testcase: TestCase | None = None
-        self.validator_first = False
-        self.sample_failures: list[SubmissionResult] = []
-        self.first_failure: TestCase | None = None
-        self.first_failure_verdict: str | None = None
-        self.group_results: dict[TestCaseGroup, SubmissionResult] | None = None
-
-    def set_ac_runtime(self) -> None:
-        if self.verdict == 'AC':
-            self.ac_runtime = self.runtime
-            self.ac_runtime_testcase = self.runtime_testcase
-
-    def __str__(self) -> str:
-        verdict = self.verdict
-        details = []
-
-        if verdict == 'AC' and self.score is not None:
-            verdict += f' ({self.score:.0f})'
-
-        if self.reason is not None:
-            details.append(self.reason)
-        if self.testcase is not None:
-            details.append(f'testcase: {self.testcase}')
-        if self.runtime != -1:
-            details.append(f'CPU: {self.runtime:.2f}s @ {self.runtime_testcase}')
-
-        if len(details) == 0:
-            return verdict
-        return f'{verdict} [{", ".join(details)}]'
-
-
-class VerifyError(Exception):
-    pass
 
 
 _T = TypeVar('_T')
 _P = ParamSpec('_P')
 
 
-class Context:
-    def __init__(self, args: argparse.Namespace, executor: ThreadPoolExecutor | None) -> None:
-        self.data_filter: Pattern[str] = args.data_filter
-        self.submission_filter: Pattern[str] = args.submission_filter
-        self.fixed_timelim: float | None = args.fixed_timelim
-        self.show_subtask_scores: bool = getattr(args, 'score', False)
-        self.use_cache: bool = getattr(args, 'cache', False)
-        self.debug_mode: bool = getattr(args, 'debug', False)
-        self.executor = executor
-        self.validation_executor: ThreadPoolExecutor | None = None
-        self._background_work: list[concurrent.futures.Future[object]] = []
-
-    def submit_background_work(self, job: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> None:
-        assert self.executor
-        self._background_work.append(self.executor.submit(job, *args, **kwargs))
-
-    def wait_for_background_work(self) -> None:
-        concurrent.futures.wait(self._background_work)
-
-
 class ProblemAspect(ABC):
-    errors: int = 0
-    warnings: int = 0
     _check_res: bool | None = None
     problem: Problem
-
-    def __append_additional_info(self, msg: str, additional_info: str | None) -> str:
-        max_additional_info = self.problem.max_additional_info()
-        if additional_info is None or max_additional_info <= 0:
-            return msg
-        additional_info = additional_info.rstrip()
-        if not additional_info:
-            return msg
-        lines = additional_info.split('\n')
-        if len(lines) == 1:
-            return f'{msg} ({lines[0]})'
-        if len(lines) > max_additional_info:
-            lines = lines[:max_additional_info] + [f'[.....truncated to {max_additional_info} lines.....]']
-
-        return f'{msg}:\n' + '\n'.join(' ' * 8 + line for line in lines)
+    _diag: Diagnostics
 
     def __init__(self, name: str, problem: Problem) -> None:
-        self.log = log.getChild(name)
+        if self is not problem:
+            self._diag = problem._diag.child(name)
         self.problem = problem
 
-    def fatal(self, msg: str, additional_info: str | None = None, *args) -> None:
+    @property
+    def errors(self) -> int:
+        return self._diag.errors
+
+    @property
+    def warnings(self) -> int:
+        return self._diag.warnings
+
+    def fatal(self, msg: str, additional_info: str | None = None) -> None:
         self._check_res = False
-        self._add_error()
-        self.log.critical(self.__append_additional_info(msg, additional_info), *args)
-        raise VerifyError(msg)
+        self._diag.fatal(msg, additional_info)
 
-    def error(self, msg: str, additional_info: str | None = None, *args) -> None:
+    def error(self, msg: str, additional_info: str | None = None) -> None:
         self._check_res = False
-        self._add_error()
-        self.log.error(self.__append_additional_info(msg, additional_info), *args)
-        if self.problem.bail_on_error():
-            raise VerifyError(msg)
+        self._diag.error(msg, additional_info)
 
-    def warning(self, msg: str, additional_info: str | None = None, *args) -> None:
-        if self.problem.consider_warnings_errors():
-            self.error(msg, additional_info, *args)
-            return
-        self._add_warning()
-        self.log.warning(self.__append_additional_info(msg, additional_info), *args)
+    def warning(self, msg: str, additional_info: str | None = None) -> None:
+        self._diag.warning(msg, additional_info)
 
-    def error_in_2023_07(self, msg: str, additional_info: str | None = None, *args) -> None:
+    def error_in_2023_07(self, msg: str, additional_info: str | None = None) -> None:
         if self.problem.format is FormatVersion.LEGACY:
-            self.warning(msg, additional_info, *args)
+            self.warning(msg, additional_info)
         else:
-            self.error(msg, additional_info, *args)
+            self.error(msg, additional_info)
 
-    def info(self, msg: str, *args) -> None:
-        self.log.info(msg, *args)
+    def info(self, msg: str) -> None:
+        self._diag.info(msg)
 
-    def debug(self, msg: str, *args) -> None:
-        self.log.debug(msg, *args)
+    def debug(self, msg: str) -> None:
+        self._diag.debug(msg)
 
     def msg(self, msg):
         print(msg)
@@ -205,18 +106,6 @@ class ProblemAspect(ABC):
             if (problem_root / directory).exists():
                 self.warning(f'Found directory "{directory}". Version {self.problem.format} looks for {name} in "{good_dir}"')
 
-    def _add_error(self) -> None:
-        self.errors += 1
-        if self.problem is not self:
-            with self.problem._counter_lock:
-                self.problem.errors += 1
-
-    def _add_warning(self) -> None:
-        self.warnings += 1
-        if self.problem is not self:
-            with self.problem._counter_lock:
-                self.problem.warnings += 1
-
 
 class ProblemPart(ProblemAspect):
     """Baseclass for all parts that can be included in a problem-format."""
@@ -229,11 +118,79 @@ class ProblemPart(ProblemAspect):
     def __init__(self, problem: Problem) -> None:
         if self.PART_NAME is None:
             raise NotImplementedError('Every problem-part must override PART_NAME')
-        super().__init__(f'{problem.shortname}.{self.PART_NAME}', problem)
+        super().__init__(self.PART_NAME, problem)
         self.setup()
 
     def setup(self) -> None:
         pass
+
+    def _print_debug_summary(
+        self,
+        debug_data: list[tuple[str, str, SubmissionResult]],
+        subtask_groups: list[TestCaseGroup],
+    ) -> None:
+        def compact_path(tc: TestCase) -> str:
+            path = tc.strip_path_prefix(tc._base)
+            if path.startswith('secret/'):
+                path = path[7:]
+            return path
+
+        console = Console()
+        vstyles = SubtaskResultsTable._VERDICT_STYLE
+
+        entries: list[tuple[str, str, SubmissionResult, list[tuple[TestCaseGroup, SubmissionResult]]]] = []
+        for sub_name, category, result in debug_data:
+            if getattr(result, 'group_results', None) is None:
+                continue
+            fail_groups = []
+            if subtask_groups:
+                for g in subtask_groups:
+                    gr = result.group_results.get(g)
+                    if gr and gr.verdict != 'AC':
+                        fail_groups.append((g, gr))
+            has_failure = bool(fail_groups) or result.verdict != 'AC'
+            if not has_failure:
+                continue
+            entries.append((sub_name, category, result, fail_groups))
+
+        if not entries:
+            console.print('\n  [bold green]✔[/bold green] [green]All solutions behaved as expected[/green]\n')
+            return
+
+        console.print()
+        console.rule('[bold red]Failures[/bold red]', style='bright_black')
+
+        for sub_name, category, result, fail_groups in entries:
+            console.print()
+            cat_style = vstyles.get(category, 'white')
+            header = f'  [bold red]✘[/bold red] [bold white]{sub_name}[/bold white]  [{cat_style}]{category}[/{cat_style}]'
+            if category != result.verdict:
+                res_style = vstyles.get(result.verdict, 'white')
+                header += f' [dim]→[/dim] [{res_style}]{result.verdict}[/{res_style}]'
+            console.print(header)
+
+            if fail_groups:
+                max_gname = max(len(os.path.basename(g._datadir)) for g, _ in fail_groups)
+                for group, gr in fail_groups:
+                    gname = os.path.basename(group._datadir)
+                    verdict = gr.verdict
+                    vs = vstyles.get(verdict, 'white')
+                    tc = getattr(gr, 'first_failure', None) or getattr(gr, 'test_node', None)
+                    tc_name = os.path.basename(tc._base) if tc and getattr(tc, '_base', None) else '?'
+                    console.print(f'    {gname:<{max_gname}}  [{vs}]{verdict:<4}[/{vs}] [dim]@[/dim] [dim]{tc_name}[/dim]')
+            elif result.verdict != 'AC':
+                tc = getattr(result, 'first_failure', None) or getattr(result, 'test_node', None)
+                tc_name = compact_path(tc) if tc and getattr(tc, '_base', None) else '?'
+                vs = vstyles.get(result.verdict, 'white')
+                console.print(f'    [{vs}]{result.verdict}[/{vs}] [dim]@ {tc_name}[/dim]')
+
+            if result.runtime >= 0 and result.runtime_testcase:
+                tc_path = compact_path(result.runtime_testcase)
+                console.print(f'    [dim]⏱ {result.runtime:.2f} @ {tc_path}[/dim]')
+
+        console.print()
+        console.rule(style='bright_black')
+        console.print()
 
     def start_background_work(self, context: Context) -> None:
         pass
@@ -243,16 +200,15 @@ class ProblemPart(ProblemAspect):
 
 
 class TestCase(ProblemAspect):
-    Result = tuple[SubmissionResult, SubmissionResult, SubmissionResult]
+    is_group: Literal[False] = False  # Temporary workaround for a circular import in judge/submission_judge.py
 
     def __init__(self, problem: Problem, base: str, testcasegroup: TestCaseGroup) -> None:
-        super().__init__(f'{problem.shortname}.test.{testcasegroup.name}.{os.path.basename(base)}', problem)
+        super().__init__(f'test.{testcasegroup.name}.{os.path.basename(base)}', problem)
         self._base = base
         self.infile = f'{base}.in'
         self.ansfile = f'{base}.ans'
         self._problem = problem
         self.testcasegroup = testcasegroup
-        self.reuse_result_from: TestCase | None = None
         self.counter = len(problem.testcase_by_infile)
         problem.testcase_by_infile[self.infile] = self
 
@@ -281,6 +237,30 @@ class TestCase(ProblemAspect):
     def strip_path_prefix(self, path: str) -> str:
         return os.path.relpath(path, os.path.join(self._problem.probdir, 'data'))
 
+    # Temporary properties for use while refactoring verifyproblem into judge/
+    @property
+    def infile_path(self) -> Path:
+        return Path(self.infile)
+
+    @property
+    def ansfile_path(self) -> Path:
+        return Path(self.ansfile)
+
+    @property
+    def output_validator_flags(self) -> list[str]:
+        return (
+            self._problem.metadata.legacy_validator_flags.split()
+            + self.testcasegroup.config.get('output_validator_flags', '').split()
+        )
+
+    @cached_property
+    def reuse_key(self) -> CacheKey:
+        return CacheKey(
+            input_hash=hashlib.sha256(self.infile_path.read_bytes()).digest(),
+            ans_hash=hashlib.sha256(self.ansfile_path.read_bytes()).digest(),
+            validator_flags=tuple(self.output_validator_flags),
+        )
+
     def is_in_sample_group(self) -> bool:
         return self.strip_path_prefix(self.infile).startswith('sample')
 
@@ -304,13 +284,19 @@ class TestCase(ProblemAspect):
                 f'Answer file ({anssize:.1f} Mb) is within 50% of output limit ({outputlim} Mb), you might want to increase output limit'
             )
         if not self._problem.is_interactive() and not self._problem.is_multi_pass():
-            val_res = self._problem.output_validators.validate(self, self.ansfile)
+            val_res = validate_output(
+                testcase=self,
+                submission_output=Path(self.ansfile),
+                output_validator=self._problem.output_validators.output_validator,
+                metadata=self._problem.metadata,
+                base_dir=Path(self._problem.tmpdir),
+                diag=self._diag,
+            )
             if val_res.verdict != 'AC':
                 if self.is_in_sample_group():
                     self.error(f'judge answer file got {val_res} on testcase {self.strip_path_prefix(self.ansfile)}')
                 else:
                     self.warning(f'judge answer file got {val_res} on testcase {self.strip_path_prefix(self.ansfile)}')
-        self._check_symlinks()
         return self._check_res
 
     def __str__(self) -> str:
@@ -319,179 +305,15 @@ class TestCase(ProblemAspect):
     def matches_filter(self, filter_re: Pattern[str]) -> bool:
         return filter_re.search(self.strip_path_prefix(self._base)) is not None
 
-    def set_symlinks(self) -> None:
-        if not os.path.islink(self.infile):
-            return
-        target = os.path.realpath(self.infile)
-        if target in self._problem.testcase_by_infile:
-            self.reuse_result_from = self._problem.testcase_by_infile[target]
-
-    def _check_symlinks(self) -> bool:
-        if not os.path.islink(self.infile):
-            return True
-        nicepath = os.path.relpath(self.infile, self._problem.probdir)
-        in_target = os.path.realpath(self.infile)
-        ans_target = os.path.realpath(self.ansfile)
-        if not in_target.endswith('.in'):
-            self.error(f"Symbolic link does not point to a .in file for input '{nicepath}'")
-            return False
-        if ans_target != f'{in_target[:-3]}.ans':
-            self.error(f"Symbolic link '{nicepath}' must have a corresponding link for answer file")
-            return False
-        if self.reuse_result_from is None:
-            self.error(f"Symbolic link points outside data/ directory for file '{nicepath}'")
-            return False
-        if (
-            self.testcasegroup.config['output_validator_flags']
-            != self.reuse_result_from.testcasegroup.config['output_validator_flags']
-        ):
-            self.error(f"Symbolic link '{nicepath}' points to testcase with different output validator flags")
-            return False
-        return True
-
-    def run_submission(self, sub, runner: Runner, context: Context) -> Result:
-        (res, res_low, res_high), reused = runner.run(self)
-        res = self._init_result_for_testcase(res)
-        res_low = self._init_result_for_testcase(res_low)
-        res_high = self._init_result_for_testcase(res_high)
-        msg = 'Reused test file result' if reused else 'Test file result'
-        self.info(f'{msg}: {res}')
-        if res.verdict != 'AC' and self.is_in_sample_group():
-            res.sample_failures.append(res)
-
-        return (res, res_low, res_high)
-
-    def run_normal(self, sub, infile: Path, time_limit: float, feedback_dir: Path) -> SubmissionResult:
-        """
-        Run a submission batch-style (non-interactive)
-        """
-        outfile = Path(self._problem.tmpdir) / f'output-{self.counter}'
-        errfile = Path(self._problem.tmpdir) / f'error-{self.counter}'
-
-        status, runtime = sub.run(
-            infile=str(infile),
-            outfile=str(outfile),
-            errfile=str(errfile),
-            timelim=math.ceil(time_limit) + 1,
-            memlim=self._problem.metadata.limits.memory,
-            work_dir=sub.path,
-        )
-        if is_TLE(status) or runtime > time_limit:
-            res_high = SubmissionResult('TLE')
-        elif is_RTE(status):
-            try:
-                with open(errfile, mode='rt') as f:
-                    info = f.read()
-            except IOError:
-                self.info('Failed to read error file %s', errfile)
-                info = None
-            res_high = SubmissionResult('RTE', additional_info=info)
-        else:
-            res_high = self._problem.output_validators.validate(
-                self, submission_output=str(outfile), infile=str(infile), feedback_dir_path=str(feedback_dir)
-            )
-
-        res_high.runtime = runtime
-        return res_high
-
-    def run_submission_multipass(self, feedback_dir: Path, run_sub_fn) -> SubmissionResult:
-        # This may be called off-main thread.
-
-        infile = Path(self.infile)
-        validation_passes = self._problem.metadata.limits.validation_passes
-
-        input_dir = Path(tempfile.mkdtemp(prefix=f'input-{self.counter}-', dir=self.problem.tmpdir))
-
-        slowest_pass = 0
-        for curr_pass in range(validation_passes):
-            res = run_sub_fn(infile)
-
-            slowest_pass = max(slowest_pass, res.runtime)
-            res.runtime = slowest_pass
-
-            nextpass_file = feedback_dir / 'nextpass.in'
-
-            if res.verdict != 'AC':
-                if nextpass_file.is_file():
-                    return SubmissionResult('JE', reason='Output validator produced nextpass.in despite non-42 exit code')
-                return res
-
-            # Done with passes
-            if not nextpass_file.is_file():
-                return res
-
-            infile = input_dir / 'input.in'
-            # Remove nextpass from feedback
-            nextpass_file.rename(infile)
-
-        return SubmissionResult('JE', reason=f'Multipass validator did not give verdict in {validation_passes=} passes')
-
-    def run_submission_real(self, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float) -> Result:
-        # This may be called off-main thread.
-
-        feedback_dir = Path(tempfile.mkdtemp(prefix=f'feedback-{self.counter}-', dir=self.problem.tmpdir))
-
-        if self._problem.is_interactive():
-
-            def run_submission(infile: Path) -> SubmissionResult:
-                return self._problem.output_validators.validate_interactive(
-                    self, sub, timelim_high, self._problem.submissions, str(infile), str(feedback_dir)
-                )
-        else:
-
-            def run_submission(infile: Path) -> SubmissionResult:
-                return self.run_normal(sub, infile, timelim_high, feedback_dir)
-
-        if self._problem.is_multi_pass():
-            res_high = self.run_submission_multipass(feedback_dir, run_submission)
-        else:
-            res_high = run_submission(Path(self.infile))
-
-        if res_high.runtime <= timelim_low:
-            res_low = res_high
-            res = res_high
-        elif res_high.runtime <= timelim:
-            res_low = SubmissionResult('TLE')
-            res = res_high
-        elif res_high.validator_first and res_high.verdict == 'WA':
-            # WA can override TLE for interactive problems (see comment in validate_interactive).
-            res = SubmissionResult('WA')
-            res.validator_first = True
-            res_low = res
-            res_high.runtime = timelim_low
-        else:
-            res_low = SubmissionResult('TLE')
-            res = res_low
-
-        res.runtime = res_high.runtime
-        res_low.runtime = res_high.runtime
-        res.set_ac_runtime()
-        res_low.set_ac_runtime()
-        res_high.set_ac_runtime()
-        return (res, res_low, res_high)
-
-    def _init_result_for_testcase(self, res: SubmissionResult) -> SubmissionResult:
-        res = copy.copy(res)
-        res.testcase = self
-        res.runtime_testcase = self
-        if res.score is None:
-            if res.verdict == 'AC':
-                res.score = self.testcasegroup.config['accept_score']
-            else:
-                res.score = self.testcasegroup.config['reject_score']
-        return res
-
     def get_all_testcases(self) -> list[TestCase]:
         return [self]
-
-    def all_datasets(self) -> list[str]:
-        return [self._base]
 
 
 class TestCaseGroup(ProblemAspect):
     name: str
     _DEFAULT_CONFIG = config.load_config('testdata.yaml')
     _SCORING_ONLY_KEYS = ['accept_score', 'reject_score', 'range']
+    is_group: Literal[True] = True  # Temporary workaround for a circular import in judge/submission_judge.py
 
     def __init__(self, problem: Problem, datadir: str | None = None, parent: TestCaseGroup | None = None):
         self._parent = parent
@@ -500,10 +322,10 @@ class TestCaseGroup(ProblemAspect):
         self._datadir = datadir
         self.name = os.path.relpath(os.path.abspath(self._datadir), os.path.abspath(self._problem.probdir)).replace('/', '.')
 
-        super().__init__(f'{problem.shortname}.test.{self.name}', problem)
+        super().__init__(f'test.{self.name}', problem)
 
         self._seen_oob_scores = False
-        self.debug('Loading test data group %s', datadir)
+        self.debug(f'Loading test data group {datadir}')
         configfile = os.path.join(self._datadir, 'testdata.yaml')
         self.config: dict[str, Any] = {}
         if os.path.isfile(configfile):
@@ -554,23 +376,16 @@ class TestCaseGroup(ProblemAspect):
                     if ext == '.ans' and os.path.isfile(f'{base}.in'):
                         self._items.append(TestCase(problem, base, self))
 
-        if not parent:
-            self.set_symlinks()
-
     def start_background_work(self, context: Context) -> None:
         pass
 
     def __str__(self) -> str:
         return f'testcase group {self.name}'
 
-    def set_symlinks(self) -> None:
-        for sub in self._items:
-            sub.set_symlinks()
-
     def matches_filter(self, filter_re: Pattern[str]) -> bool:
         return True
 
-    def get_all_testcases(self) -> list:
+    def get_all_testcases(self) -> list[TestCase]:
         res: list = []
         for child in self._items:
             res += child.get_all_testcases()
@@ -579,14 +394,14 @@ class TestCaseGroup(ProblemAspect):
     def get_testcases(self) -> list[TestCase]:
         return [child for child in self._items if isinstance(child, TestCase)]
 
-    def get_subgroups(self) -> list[TestCaseGroup]:
-        return [child for child in self._items if isinstance(child, TestCaseGroup)]
+    def get_subgroups(self) -> list["TestCaseGroup"]:
+        return [child for child in self._items if getattr(child, 'is_group', True)]
 
-    def get_subgroup(self, name: str) -> TestCaseGroup | None:
-        return next(
-            (child for child in self._items if isinstance(child, TestCaseGroup) and os.path.basename(child._datadir) == name),
-            None,
-        )
+    def get_subgroup(self, name: str) -> "TestCaseGroup | None":
+        for child in self._items:
+            if getattr(child, 'is_group', True) and os.path.basename(child._datadir) == name:
+                return child
+        return None
 
     def has_custom_groups(self) -> bool:
         return any(group.get_subgroups() for group in self.get_subgroups())
@@ -598,6 +413,17 @@ class TestCaseGroup(ProblemAspect):
             return (min_score, max_score)
         except Exception:
             return (float('-inf'), float('inf'))
+
+    def check_score_in_bounds(self, sub: run.Program, score: float) -> None:
+        # Don't warn twice on the same subgroup, since every submission is likely
+        # to have the same error.
+        min_score, max_score = self.get_score_range()
+        if not (min_score <= score <= max_score) and not self._seen_oob_scores:
+            self._seen_oob_scores = True
+            groupname = os.path.relpath(self._datadir, self._problem.probdir)
+            self.error(
+                f'submission {sub} got score {score} on group {groupname}, which is outside of expected score range [{min_score}, {max_score}]'
+            )
 
     def check(self, context: Context) -> bool:
         if self._check_res is not None:
@@ -718,7 +544,7 @@ class TestCaseGroup(ProblemAspect):
                 return ret, i
 
             while i < len(a) and j < len(b):
-                if ord('0') <= ord(a[i]) <= ord('9') and ord('0') <= ord(b[i]) <= ord('9'):
+                if ord('0') <= ord(a[i]) <= ord('9') and ord('0') <= ord(b[j]) <= ord('9'):
                     anum, i = parse_num(a, i)
                     bnum, j = parse_num(b, j)
                     if anum == bnum:
@@ -738,10 +564,10 @@ class TestCaseGroup(ProblemAspect):
                 self.warning(f"Test data group '{last_testgroup_name}' will be ordered before '{name}'; consider zero-padding")
             last_testgroup_name = name
 
-        testcases = [c for c in self._items if isinstance(c, TestCase) and c.matches_filter(context.data_filter)]
-        groups = [c for c in self._items if isinstance(c, TestCaseGroup) and c.matches_filter(context.data_filter)]
+        testcases = [c for c in self._items if getattr(c, 'is_group', True) is False and c.matches_filter(context.data_filter)]
+        groups = [c for c in self._items if getattr(c, 'is_group', True) and c.matches_filter(context.data_filter)]
 
-        if context.validation_executor is not None and len(testcases) > 1:
+        if getattr(context, 'validation_executor', None) is not None and len(testcases) > 1:
             futures = [context.validation_executor.submit(tc.check, context) for tc in testcases]
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -758,85 +584,6 @@ class TestCaseGroup(ProblemAspect):
             group.check(context)
 
         return self._check_res
-
-    def run_submission(self, sub, runner: Runner, context: Context) -> TestCase.Result:
-        self.info(f'Running on {self}')
-        subres: list[SubmissionResult] = []
-        subres_low: list[SubmissionResult] = []
-        subres_high: list[SubmissionResult] = []
-        active_low, active = True, True
-        on_reject = self.config['on_reject']
-        broken = False
-        for child in self._items:
-            if not child.matches_filter(context.data_filter):
-                continue
-            res, res_low, res_high = child.run_submission(sub, runner, context)
-            subres_high.append(res_high)
-            if active:
-                subres.append(res)
-            if active_low:
-                subres_low.append(res_low)
-            if on_reject == 'break':
-                active_low &= res_low.verdict == 'AC'
-                active &= res.verdict == 'AC'
-                if res_high.verdict != 'AC':
-                    broken = True
-                    break
-
-        runner.mark_group_done(self, broken)
-
-        res_main = self.aggregate_results(sub, subres)
-        runner.group_results[self] = res_main
-        return (
-            res_main,
-            self.aggregate_results(sub, subres_low, shadow_result=True),
-            self.aggregate_results(sub, subres_high, shadow_result=True),
-        )
-
-    def aggregate_results(self, sub, sub_results: list[SubmissionResult], shadow_result: bool = False) -> SubmissionResult:
-        res = SubmissionResult('JE')
-
-        for r in sub_results:
-            if r.runtime > res.runtime:
-                res.runtime = r.runtime
-                res.runtime_testcase = r.runtime_testcase
-            if r.ac_runtime > res.ac_runtime:
-                res.ac_runtime = r.ac_runtime
-                res.ac_runtime_testcase = r.ac_runtime_testcase
-            if r.verdict != 'AC' and res.first_failure is None:
-                res.first_failure = r.testcase
-                res.first_failure_verdict = r.verdict
-            res.sample_failures.extend(r.sample_failures)
-
-        judge_error = next((r for r in sub_results if r.verdict == 'JE'), None)
-        if judge_error:
-            res.verdict = judge_error.verdict
-            res.reason = judge_error.reason
-            res.additional_info = judge_error.additional_info
-            res.testcase = judge_error.testcase
-        else:
-            res.verdict, score = self._problem.graders.grade(sub_results, self, shadow_result)
-            if sub_results:
-                res.testcase = sub_results[-1].testcase
-                res.additional_info = sub_results[-1].additional_info
-            if self._problem.is_scoring():
-                res.score = score
-                min_score, max_score = self.get_score_range()
-                if score is not None and not (min_score <= score <= max_score) and not self._seen_oob_scores:
-                    # Don't warn twice on the same subgroup, since every submission is likely
-                    # to have the same error.
-                    self._seen_oob_scores = True
-                    groupname = os.path.relpath(self._datadir, self._problem.probdir)
-                    self.error(
-                        f'submission {sub} got {res} on group {groupname}, which is outside of expected score range [{min_score}, {max_score}]'
-                    )
-        return res
-
-    def all_datasets(self) -> list:
-        res: list = []
-        for child in self._items:
-            res += child.all_datasets()
-        return res
 
 
 class ProblemStatement(ProblemPart):
@@ -1194,7 +941,7 @@ class InputValidators(ProblemPart):
                 for flags_str in all_flags:
                     flags = flags_str.split()
                     for val in self._validators:
-                        status, _ = val.run(file_name, args=flags)
+                        status, _ = val.run(file_name, args=flags, work_dir=self.problem.tmpdir)
                         if os.WEXITSTATUS(status) != 42:
                             break
                     else:
@@ -1202,9 +949,12 @@ class InputValidators(ProblemPart):
 
             def modified_input_validates(applicable, modifier):
                 for testcase in self.problem.testdata.get_all_testcases():
-                    with open(testcase.infile) as infile:
-                        infile_data = infile.read()
-                    if not applicable(infile_data):
+                    try:
+                        with open(testcase.infile) as infile:
+                            infile_data = infile.read()
+                        if not applicable(infile_data):
+                            continue
+                    except UnicodeDecodeError:
                         continue
 
                     with open(file_name, 'wb') as f:
@@ -1213,7 +963,7 @@ class InputValidators(ProblemPart):
                     for flags_str in all_flags:
                         flags = flags_str.split()
                         for val in self._validators:
-                            status, _ = val.run(file_name, args=flags)
+                            status, _ = val.run(file_name, args=flags, work_dir=self.problem.tmpdir)
                             if os.WEXITSTATUS(status) != 42:
                                 # expected behavior; validator rejects modified input
                                 return False
@@ -1241,7 +991,7 @@ class InputValidators(ProblemPart):
 
         for val in self._validators:
             with tempfile.NamedTemporaryFile() as outfile, tempfile.NamedTemporaryFile() as errfile:
-                status, _ = val.run(testcase.infile, outfile.name, errfile.name, args=flags)
+                status, _ = val.run(testcase.infile, outfile.name, errfile.name, args=flags, work_dir=self.problem.tmpdir)
                 if not os.WIFEXITED(status):
                     emsg = f'Input format validator {val} crashed on input {testcase.infile}'
                 elif os.WEXITSTATUS(status) != 42:
@@ -1287,94 +1037,6 @@ class Graders(ProblemPart):
                 self.fatal(f'Compile error for {self._grader}', msg)
         return self._check_res
 
-    def grade(
-        self, sub_results: list[SubmissionResult], testcasegroup: TestCaseGroup, shadow_result: bool = False
-    ) -> tuple[Verdict, float | None]:
-        if testcasegroup.config['grading'] == 'default':
-            if not self._default_grader:
-                self.fatal('Failed to locate default grader')
-                return ('JE', None)
-            grader = self._default_grader
-        else:
-            if not self._grader:
-                self.fatal('Problem has grading: custom without any custom grader')
-                return ('JE', None)
-            grader = self._grader
-
-        if not grader.compile()[0]:
-            self.fatal(f'Failed to compile grader {grader}', grader.compile()[1])
-            return ('JE', None)
-
-        grader_input = ''.join([f'{r.verdict} {0 if r.score is None else r.score}\n' for r in sub_results])
-        grader_output_re = r'^((AC)|(WA)|(TLE)|(RTE)|(JE))\s+-?[0-9.]+\s*$'
-        verdict: Verdict = 'AC'
-        score: float = 0
-
-        if not sub_results:
-            self.info(f'No results on {testcasegroup}, so no grader ran')
-            return (verdict, score)
-
-        grader_flags = testcasegroup.config['grader_flags'].split()
-        self.debug(f'Grading {len(sub_results)} results:\n{grader_input}')
-        self.debug(f'Grader flags: {grader_flags}')
-
-        infile_path = outfile_path = errfile_path = None
-        try:
-            # Create input and output files for grader
-            # We do it in this awkward way because the files need to be closed before reading/writing
-            with tempfile.NamedTemporaryFile(mode='w', delete=False) as infile:
-                infile.write(grader_input)
-                infile_path = infile.name
-
-            with tempfile.NamedTemporaryFile(delete=False) as outfile:
-                outfile_path = outfile.name
-
-            with tempfile.NamedTemporaryFile(delete=False) as errfile:
-                errfile_path = errfile.name
-
-            status, runtime = grader.run(infile_path, outfile_path, errfile_path, args=grader_flags)
-
-            with open(outfile_path, 'r') as fh:
-                grader_output = fh.read()
-
-            with open(errfile_path, 'r') as errfile:
-                stderr_content = errfile.read()
-
-            if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
-                if not os.WIFEXITED(status):
-                    self.error(f'Judge error: {grader} crashed')
-                else:
-                    self.error(f'Judge error: exit code {os.WEXITSTATUS(status)} for grader {grader}, expected 0')
-                self.error(f'Grader stderr:\n{stderr_content}\n')
-                self.debug(f'Grader input:\n{grader_input}')
-                return ('JE', None)
-
-            if not re.match(grader_output_re, grader_output):
-                self.error('Judge error: invalid format of grader output')
-                self.debug(f'Output must match: "{grader_output_re}"')
-                self.debug(f'Output was: "{grader_output}"')
-                return ('JE', None)
-
-            verdict_str, score_str = grader_output.split()
-            # Make mypy happy by explicitly using cast
-            verdict = cast(Verdict, verdict_str)
-            score = float(score_str)
-
-            if not shadow_result:
-                self.debug(f'Grade on {testcasegroup} is {verdict} ({score})')
-
-            return (verdict, score)
-        except Exception as e:
-            self.error(f'Grader failed with exception {e}')
-            return ('JE', None)
-        finally:
-            for path in [infile_path, outfile_path, errfile_path]:
-                if path:
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-
 
 class OutputValidators(ProblemPart):
     _default_validator = run.get_tool('default_validator')
@@ -1394,13 +1056,18 @@ class OutputValidators(ProblemPart):
             return self.problem.metadata.legacy_validation == 'default'
         return not self._validators
 
+    @property
+    def output_validator(self) -> run.Program:
+        if self.uses_default_validator() or not self._validators:
+            return self._default_validator
+        return self._validators[0]
+
     def __str__(self) -> str:
         return 'output validators'
 
     def start_background_work(self, context: Context) -> None:
         if not self._has_precompiled:
-            for val in self._actual_validators():
-                context.submit_background_work(lambda v: v.compile(), val)
+            context.submit_background_work(lambda v: v.compile(), self.output_validator)
             self._has_precompiled = True
 
     def check(self, context: Context) -> bool:
@@ -1410,16 +1077,19 @@ class OutputValidators(ProblemPart):
 
         self.warn_directory('output validators', 'output_validator_directory')
 
-        safe_output_validator_languages = {'c', 'cpp', 'python3'}
-
-        for v in self._validators:
-            if isinstance(v, run.SourceCode) and v.language.lang_id not in safe_output_validator_languages:
-                self.error_in_2023_07(
-                    f'Output validator in {v.language.name}. Only {safe_output_validator_languages} are standardized. Check carefully if your CCS supports more (Kattis does not).'
-                )
-
         if len(self._validators) > 1:
-            self.error_in_2023_07('Found more than one output validator. This was allowed in legacy (but not on Kattis)')
+            self.error_in_2023_07(
+                f'Support for multiple output validators has been dropped. will only use {self.output_validator}'
+            )
+
+        safe_output_validator_languages = {'c', 'cpp', 'python3'}
+        if (
+            isinstance(self.output_validator, run.SourceCode)
+            and self.output_validator.language.lang_id not in safe_output_validator_languages
+        ):
+            self.error_in_2023_07(
+                f'Output validator in {self.output_validator.language.name}. Only {safe_output_validator_languages} are standardized. Check carefully if your CCS supports more (Kattis does not).'
+            )
 
         if self.uses_default_validator() and self._validators:
             self.error('There are validator programs but problem.yaml has validation = "default"')
@@ -1429,18 +1099,15 @@ class OutputValidators(ProblemPart):
         if self.uses_default_validator() and self._default_validator is None:
             self.fatal('Unable to locate default validator')
 
-        for val in self._validators[:]:
-            try:
-                success, msg = val.compile()
-                if not success:
-                    self.fatal(f'Compile error for output validator {val}', msg)
-            except run.ProgramError as e:
-                self.error(str(e))
+        try:
+            success, msg = self.output_validator.compile()
+            if not success:
+                self.fatal(f'Compile error for output validator {self.output_validator}', msg)
+        except run.ProgramError as e:
+            self.fatal(f'Compile error for output validator {self.output_validator}', str(e))
 
         # Only sanity check output validators if they all actually compiled
         if self._check_res:
-            flags = self.problem.metadata.legacy_validator_flags
-
             # Sanity check cases that should be rejected by the output validator
             def run_junk_case(case_desc: str, junk_content: bytes, testcases: list[TestCase]) -> list[SubmissionResult]:
                 results = []
@@ -1448,10 +1115,17 @@ class OutputValidators(ProblemPart):
                     f.write(junk_content)
                     f.flush()
                     for testcase in testcases:
-                        result = self.validate(testcase, f.name)
+                        result = validate_output(
+                            testcase=testcase,
+                            submission_output=Path(f.name),
+                            output_validator=self.output_validator,
+                            metadata=self.problem.metadata,
+                            base_dir=Path(self.problem.tmpdir),
+                            diag=self._diag,
+                        )
                         results.append(result)
                         if result.verdict == 'JE':
-                            self.error(f'{case_desc} as output, and output validator flags "{" ".join(flags)}" gave {result}')
+                            self.error(f'{case_desc} as output on test case {testcase} gave {result}')
                             break
                 return results
 
@@ -1462,547 +1136,20 @@ class OutputValidators(ProblemPart):
                 if not rejected:
                     self.warning(f'{desc} gets AC')
 
-            # For performance reasons, strongly limit the amount of testcases we run on
-            fast_languages = {'c', 'cpp'}
-            all_validators_are_fast = True
-            for val in self._validators:
-                if isinstance(val, run.SourceCode):
-                    all_validators_are_fast &= val.language.lang_id in fast_languages
-            num_testcases = 3 if all_validators_are_fast else 1
-            test_cases = self.problem.testdata.get_all_testcases()[:num_testcases]
             # Malformed cases that a poorly-written output validator might crash on
-            # Note that these might be valid output, so we only check if it crashes
+            # Note that these might be valid output, so we only check if it crashes.
+            # These bugs are rarely dependent on the actual test case, so we just
+            # run on a few to keep things speedy.
+            test_cases = self.problem.testdata.get_all_testcases()[:3]
             for desc, junk_case_content in _JUNK_CASES_CRASH:
                 run_junk_case(desc, junk_case_content, test_cases)
 
         return self._check_res
 
-    @staticmethod
-    def _get_feedback(feedback_dir: str) -> str | None:
-        all_feedback = []
-        for feedback_file in os.listdir(feedback_dir):
-            feedback_path = os.path.join(feedback_dir, feedback_file)
-            if os.path.getsize(feedback_path) == 0:
-                continue
-            all_feedback.append(f'=== {feedback_file}: ===')
-            # Note: The file could contain non-unicode characters, "replace" to be on the safe side
-            with open(feedback_path, 'r', errors='replace') as feedback:
-                # Cap amount of feedback per file at some high-ish
-                # size, so that a buggy validator spewing out lots of
-                # data doesn't kill us.
-                all_feedback.append(feedback.read(128 * 1024))
-        if all_feedback:
-            return '\n'.join(all_feedback)
-        return None
-
-    def _parse_validator_results(self, val, status: int, feedbackdir, testcase: TestCase) -> SubmissionResult:
-        score = None
-        # TODO: would be good to have some way of displaying the feedback for debugging uses
-        score_file = os.path.join(feedbackdir, 'score.txt')
-        if not self.problem.metadata.is_custom_score_allowed() and os.path.isfile(score_file):
-            return SubmissionResult(
-                'JE', reason='validator produced "score.txt" but problem does not have custom scoring activated'
-            )
-
-        if not os.WIFEXITED(status):
-            return SubmissionResult(
-                'JE',
-                reason=f'output validator {val} crashed, status {status}',
-                additional_info=OutputValidators._get_feedback(feedbackdir),
-            )
-        ret = os.WEXITSTATUS(status)
-        if ret not in [42, 43]:
-            return SubmissionResult(
-                'JE',
-                reason=f'output validator {val} exited with status {ret}',
-                additional_info=OutputValidators._get_feedback(feedbackdir),
-            )
-
-        if ret == 43:
-            return SubmissionResult('WA', additional_info=OutputValidators._get_feedback(feedbackdir))
-
-        if self.problem.metadata.is_custom_score_mandatory():
-            if os.path.isfile(score_file):
-                try:
-                    score_str = open(score_file).read()
-                    score = float(score_str)
-                except Exception as e:
-                    return SubmissionResult('JE', reason=f'failed to parse validator score: {e}')
-            else:
-                # If we're running multipass, we do not need to output a score after every pass
-                # We accept the small risk of allowing a non-multipass output validator to not output score.txt
-                # if it produces a file called nextpass.in
-                if (Path(feedbackdir) / 'nextpass.in').exists():
-                    score = 0
-                else:
-                    return SubmissionResult('JE', reason='problem has custom scoring but validator did not produce "score.txt"')
-
-        return SubmissionResult('AC', score=score)
-
-    def _actual_validators(self) -> list:
-        if self.uses_default_validator():
-            return [self._default_validator]
-        return self._validators
-
-    def validate_interactive(
-        self,
-        testcase: TestCase,
-        submission,
-        timelim: float,
-        errorhandler: Submissions,
-        infile: str | None = None,
-        feedback_dir_path: str | None = None,
-    ) -> SubmissionResult:
-        # This may be called off-main thread.
-        interactive_output_re = r'\d+ \d+\.\d+ \d+ \d+\.\d+ (validator|submission)'
-        res = SubmissionResult('JE')
-        interactive = run.get_tool('interactive')
-        if interactive is None:
-            errorhandler.error('Could not locate interactive runner')
-            return res
-        # file descriptor, wall time lim
-        initargs = ['1', str(math.ceil(2 * timelim))]
-        validator_args = [infile if infile else testcase.infile, testcase.ansfile, '<feedbackdir>']
-        submission_args = submission.get_runcmd(memlim=self.problem.metadata.limits.memory)
-
-        val_memlim = self.problem.metadata.limits.validation_memory
-        for i, val in enumerate(self._actual_validators()):
-            if val.compile()[0]:
-                # If we are running multiple output validators in legacy, make sure to wipe it
-                # If we are running multipass, i will always be 0 and we do not accidentally wipe feedback
-                if i > 0 and feedback_dir_path:
-                    shutil.rmtree(feedback_dir_path)
-                    Path(feedback_dir_path).mkdir()
-
-                if feedback_dir_path:
-                    feedbackdir = feedback_dir_path
-                else:
-                    feedbackdir = tempfile.mkdtemp(prefix='feedback', dir=self.problem.tmpdir)
-
-                validator_args[2] = feedbackdir + os.sep
-                f = tempfile.NamedTemporaryFile(delete=False)
-                interactive_out = f.name
-                f.close()
-                i_status, _ = interactive.run(
-                    outfile=interactive_out,
-                    args=initargs + val.get_runcmd(memlim=val_memlim) + validator_args + [';'] + submission_args,
-                    work_dir=submission.path,
-                )
-                if is_RTE(i_status):
-                    errorhandler.error(f'Interactive crashed, status {i_status}')
-                else:
-                    interactive_output = open(interactive_out).read()
-                    errorhandler.debug(f'Interactive output: "{interactive_output}"')
-                    if not re.match(interactive_output_re, interactive_output):
-                        errorhandler.error(
-                            f'Output from interactive does not follow expected format, got output "{interactive_output}"'
-                        )
-                    else:
-                        val_status_str, _, sub_status_str, sub_runtime_str, first = interactive_output.split()
-                        sub_status = int(sub_status_str)
-                        sub_runtime = float(sub_runtime_str)
-                        val_status = int(val_status_str)
-                        val_JE = not os.WIFEXITED(val_status) or os.WEXITSTATUS(val_status) not in [42, 43]
-                        val_WA = os.WIFEXITED(val_status) and os.WEXITSTATUS(val_status) == 43
-                        if val_JE or (val_WA and first == 'validator'):
-                            # If the validator crashed, or exited first with WA,
-                            # always follow validator verdict, even if that early
-                            # exit caused the submission to behave erratically and
-                            # time out.
-                            if sub_runtime > timelim:
-                                sub_runtime = timelim
-                            res = self._parse_validator_results(val, val_status, feedbackdir, testcase)
-                        elif is_TLE(sub_status, True) or sub_runtime > timelim:
-                            res = SubmissionResult('TLE')
-                        elif is_RTE(sub_status):
-                            res = SubmissionResult('RTE')
-                        else:
-                            res = self._parse_validator_results(val, val_status, feedbackdir, testcase)
-
-                        res.runtime = sub_runtime
-                        res.validator_first = first == 'validator'
-
-                os.unlink(interactive_out)
-                if feedback_dir_path is None:
-                    shutil.rmtree(feedbackdir)
-                if res.verdict != 'AC':
-                    return res
-        return res
-
-    def validate(
-        self, testcase: TestCase, submission_output: str, infile: str | None = None, feedback_dir_path: str | None = None
-    ) -> SubmissionResult:
-        """
-        Run all output validators on the given test case and submission output.
-        Parameters:
-            testcase: The test case we are validating.
-            submission_output: Path to out file of submission.
-            infile: The input file. Overrides testcase.infile if we are running multipass.
-            feedback_dir_path: Path to feedback directory. If None, a temporary directory will be created and cleaned up.
-        """
-        res = SubmissionResult('JE')
-        val_timelim = self.problem.metadata.limits.validation_time
-        val_memlim = self.problem.metadata.limits.validation_memory
-        flags = (
-            self.problem.metadata.legacy_validator_flags.split() + testcase.testcasegroup.config['output_validator_flags'].split()
-        )
-        for i, val in enumerate(self._actual_validators()):
-            if val.compile()[0]:
-                # If we are running multiple output validators in legacy, make sure to wipe it
-                # If we are running multipass, i will always be 0 and we do not accidentally wipe feedback
-                if i > 0 and feedback_dir_path:
-                    shutil.rmtree(feedback_dir_path)
-                    Path(feedback_dir_path).mkdir()
-
-                if feedback_dir_path:
-                    feedbackdir = feedback_dir_path
-                else:
-                    feedbackdir = tempfile.mkdtemp(prefix='feedback', dir=self.problem.tmpdir)
-
-                validator_output = tempfile.mkdtemp(prefix='checker_out', dir=self.problem.tmpdir)
-                outfile = validator_output + '/out.txt'
-                errfile = validator_output + '/err.txt'
-                status, runtime = val.run(
-                    infile=submission_output,
-                    args=[infile if infile else testcase.infile, testcase.ansfile, feedbackdir] + flags,
-                    timelim=val_timelim,
-                    memlim=val_memlim,
-                    outfile=outfile,
-                    errfile=errfile,
-                )
-                if self.log.isEnabledFor(logging.DEBUG):
-                    try:
-                        with open(outfile, mode='rt') as f:
-                            output = f.read()
-                        if output:
-                            self.log.debug('Validator output:\n%s', output)
-                        with open(errfile, mode='rt') as f:
-                            error = f.read()
-                        if error:
-                            self.log.debug('Validator stderr:\n%s', error)
-                    except IOError as e:
-                        self.info('Failed to read validator output: %s', e)
-                res = self._parse_validator_results(val, status, feedbackdir, testcase)
-                shutil.rmtree(validator_output)
-                if feedback_dir_path is None:
-                    shutil.rmtree(feedbackdir)
-                if res.verdict != 'AC':
-                    return res
-
-        # TODO: check that all output validators give same result
-        return res
-
-
-class ResultCache:
-    """Cross-run cache for single-testcase execution results.
-
-    Stores results keyed by a SHA-256 digest of every factor that affects
-    execution outcome: solution source, input/answer file content, output
-    validator source, validator flags, memory limit, and language.
-
-    Time limit is NOT part of the key.  Instead, the cached runtime is
-    compared against the current time limit to decide whether the cached
-    entry is still valid:
-      - Non-TLE verdict: valid when cached_runtime <= current timelim_high
-      - TLE verdict:     valid when cached timelim_high >= current timelim_high
-    """
-
-    _CACHE_DIR = '/tmp/problemtools/cache'
-
-    def __init__(self) -> None:
-        os.makedirs(self._CACHE_DIR, exist_ok=True)
-        self._file_hashes: dict[str, str] = {}
-
-    # -- hashing helpers ---------------------------------------------------
-
-    def _hash_file_content(self, path: str) -> str:
-        """SHA-256 hex digest of file content, memoised per path."""
-        digest = self._file_hashes.get(path)
-        if digest is None:
-            h = hashlib.sha256()
-            with open(path, 'rb') as f:
-                while chunk := f.read(65536):
-                    h.update(chunk)
-            digest = h.hexdigest()
-            self._file_hashes[path] = digest
-        return digest
-
-    def _make_key(self, sub: run.SourceCode, testcase: TestCase, problem: Problem) -> str:
-        h = hashlib.sha256()
-
-        # Submission source + language
-        h.update(b'lang:')
-        h.update(sub.language.lang_id.encode())
-        for src_file in sorted(sub.src):
-            h.update(os.path.basename(src_file).encode())
-            h.update(self._hash_file_content(src_file).encode())
-
-        # Input file
-        h.update(b'\x00in:')
-        h.update(self._hash_file_content(testcase.infile).encode())
-
-        # Answer file
-        h.update(b'\x00ans:')
-        h.update(self._hash_file_content(testcase.ansfile).encode())
-
-        # Output validator identity
-        h.update(b'\x00val:')
-        if problem.output_validators.uses_default_validator():
-            h.update(b'default')
-        else:
-            for val in problem.output_validators._validators:
-                if hasattr(val, 'src'):
-                    for src_file in sorted(val.src):
-                        h.update(os.path.basename(src_file).encode())
-                        h.update(self._hash_file_content(src_file).encode())
-
-        # Validator flags (legacy global + per-group)
-        h.update(b'\x00vflags:')
-        flags = (
-            problem.metadata.legacy_validator_flags
-            + '\x00'
-            + testcase.testcasegroup.config['output_validator_flags']
-        )
-        h.update(flags.encode())
-
-        # Memory limit (exact match)
-        h.update(b'\x00memlim:')
-        h.update(str(problem.metadata.limits.memory).encode())
-
-        return h.hexdigest()
-
-    # -- public API --------------------------------------------------------
-
-    def lookup(
-        self, sub: run.SourceCode, testcase: TestCase, problem: Problem, timelim_high: float,
-    ) -> SubmissionResult | None:
-        key = self._make_key(sub, testcase, problem)
-        path = os.path.join(self._CACHE_DIR, f'{key}.json')
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return None
-
-        cached_verdict: str = data['verdict']
-        cached_runtime: float = data['runtime']
-        cached_timelim: float = data['timelim_high']
-
-        # Time-limit reuse logic
-        if cached_verdict == 'TLE':
-            # TLE at cached_timelim → still TLE at any shorter/equal limit.
-            # With *more* time the submission might succeed → miss.
-            if cached_timelim < timelim_high:
-                return None
-        else:
-            # Process completed.  Valid only when the process would finish
-            # before the current time limit (if runtime > timelim_high the
-            # OS might kill it at a different point producing different output).
-            if cached_runtime > timelim_high:
-                return None
-
-        res = SubmissionResult(
-            cached_verdict,
-            score=data.get('score'),
-            reason=data.get('reason'),
-            additional_info=data.get('additional_info'),
-        )
-        res.runtime = cached_runtime
-        return res
-
-    def store(
-        self, sub: run.SourceCode, testcase: TestCase, problem: Problem,
-        timelim_high: float, res_high: SubmissionResult,
-    ) -> None:
-        key = self._make_key(sub, testcase, problem)
-        data = {
-            'verdict': res_high.verdict,
-            'runtime': res_high.runtime,
-            'score': res_high.score,
-            'reason': res_high.reason,
-            'additional_info': res_high.additional_info,
-            'timelim_high': timelim_high,
-        }
-        path = os.path.join(self._CACHE_DIR, f'{key}.json')
-        tmp = f'{path}.tmp.{os.getpid()}'
-        try:
-            with open(tmp, 'w') as f:
-                json.dump(data, f)
-            os.replace(tmp, path)  # atomic on same filesystem
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-
-class Runner:
-    def __init__(self, problem: Problem, sub, context: Context, timelim: float, timelim_low: float, timelim_high: float, subtask_table: SubtaskResultsTable | None = None, result_cache: ResultCache | None = None) -> None:
-        self._problem = problem
-        self._sub = sub
-        self._context = context
-        self._multithreaded = context.executor is not None
-        self._timelim = timelim
-        self._timelim_low = timelim_low
-        self._timelim_high = timelim_high
-        self._subtask_table = subtask_table
-        self._result_cache = result_cache
-        self._cache: dict[TestCase, TestCase.Result] = {}
-        self.group_results: dict[TestCaseGroup, SubmissionResult] = {}
-        if self._multithreaded:
-            self._queues: dict[TestCase, queue.Queue[TestCase.Result]] = {}
-            self._lock = threading.Lock()
-            self._started_jobs: set[TestCase] = set()
-            self._done_groups: set[TestCaseGroup] = set()
-            self._remaining_jobs: list[TestCase] = []
-            self._recompute_jobs()
-
-    def __enter__(self) -> Runner:
-        if self._multithreaded:
-            for i in range(len(self._remaining_jobs)):
-                self._context.submit_background_work(self._work)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        if self._multithreaded:
-            with self._lock:
-                self._remaining_jobs = []
-
-    def run(self, testcase: TestCase) -> tuple[TestCase.Result, bool]:
-        while testcase.reuse_result_from:
-            testcase = testcase.reuse_result_from
-
-        if testcase in self._cache:
-            return (self._cache[testcase], True)
-
-        progress_msg = f'Running {self._sub} on {testcase}...'
-        if self._subtask_table is not None:
-            self._subtask_table.set_status(progress_msg)
-        elif sys.stdout.isatty():
-            sys.stdout.write(progress_msg)
-            sys.stdout.flush()
-
-        if self._multithreaded:
-            result = self._queues[testcase].get()
-        else:
-            result = self._run_submission_real(testcase)
-
-        if self._subtask_table is not None:
-            self._subtask_table.clear_status()
-        elif sys.stdout.isatty():
-            sys.stdout.write('\b \b' * len(progress_msg))
-
-        self._cache[testcase] = result
-        return (result, False)
-
-    def mark_group_done(self, group: TestCaseGroup, broken: bool) -> None:
-        if self._multithreaded:
-            self._done_groups.add(group)
-            if broken:
-                # Since a group was broken out of, some test cases may no
-                # longer be relevant to run. Recompute the work list.
-                self._recompute_jobs()
-
-    def _run_submission_real(self, item: TestCase) -> TestCase.Result:
-        # Cross-run cache: skip execution when a valid cached result exists.
-        # Interactive problems are not cached because the validator/submission
-        # pipe interaction makes runtime semantics more complex.
-        cacheable = self._result_cache is not None and not self._problem.is_interactive()
-        if cacheable:
-            assert self._result_cache is not None
-            cached = self._result_cache.lookup(
-                self._sub, item, self._problem, self._timelim_high,
-            )
-            if cached is not None:
-                return self._bucket_by_timelim(cached)
-
-        result = item.run_submission_real(self._sub, self._context, self._timelim, self._timelim_low, self._timelim_high)
-
-        if cacheable:
-            assert self._result_cache is not None
-            res_high = result[2]  # third element is the raw res_high
-            self._result_cache.store(
-                self._sub, item, self._problem, self._timelim_high, res_high,
-            )
-
-        return result
-
-    def _bucket_by_timelim(self, res_high: SubmissionResult) -> TestCase.Result:
-        """Derive (res, res_low, res_high) from a raw execution result.
-
-        Mirrors the timelim bucketing logic in TestCase.run_submission_real.
-        """
-        if res_high.runtime <= self._timelim_low:
-            res_low = res_high
-            res = res_high
-        elif res_high.runtime <= self._timelim:
-            res_low = SubmissionResult('TLE')
-            res = res_high
-        else:
-            res_low = SubmissionResult('TLE')
-            res = res_low
-        res.runtime = res_high.runtime
-        res_low.runtime = res_high.runtime
-        res.set_ac_runtime()
-        res_low.set_ac_runtime()
-        res_high.set_ac_runtime()
-        return (res, res_low, res_high)
-
-    def _work(self) -> None:
-        item = self._next_job()
-        if item:
-            res = self._run_submission_real(item)
-            self._queues[item].put(res)
-
-    def _gather_testcases(self, item: TestCase | TestCaseGroup) -> list[TestCase]:
-        if not item.matches_filter(self._context.data_filter):
-            return []
-        if isinstance(item, TestCase):
-            # If testcase is symlink, recursively follow the symlinks until we get a real testcase, ignoring
-            # whether the name of testcases pointed to matches the filter
-            while item.reuse_result_from:
-                item = item.reuse_result_from
-
-            return [item]
-        elif item not in self._done_groups:
-            ret = []
-            for child in item.get_testcases() + item.get_subgroups():
-                ret.extend(self._gather_testcases(child))
-            return ret
-        else:
-            return []
-
-    def _next_job(self) -> TestCase | None:
-        with self._lock:
-            if self._remaining_jobs:
-                job = self._remaining_jobs.pop()
-                self._started_jobs.add(job)
-                return job
-            else:
-                return None
-
-    def _recompute_jobs(self) -> None:
-        with self._lock:
-            seen = set(self._started_jobs)
-            self._remaining_jobs = []
-            for testcase in self._gather_testcases(self._problem.testdata):
-                if testcase not in seen:
-                    seen.add(testcase)
-                    self._remaining_jobs.append(testcase)
-                    if testcase not in self._queues:
-                        self._queues[testcase] = queue.Queue(maxsize=1)
-            self._remaining_jobs.reverse()
 
 
 class SubtaskResultsTable:
-    """Live-updating table: one row per submission, one column per subtask.
-
-    Uses auto_refresh=False so the terminal is only redrawn when data actually
-    changes (new testcase started, new submission finished).  Between those
-    events the display is completely still, eliminating flicker.
-    The last testcase name is intentionally left in the caption until the next
-    one replaces it — "prefer outdated over nothing".
-    """
+    """Live-updating table: one row per submission, one column per subtask."""
 
     _VERDICT_STYLE: dict[str, str] = {
         'AC': 'bold green',
@@ -2016,12 +1163,12 @@ class SubtaskResultsTable:
     }
 
     _VERDICT_ICON: dict[str, str] = {
-        'AC': '\u2714',
-        'TLE': '\u23f1',
-        'OLE': '\U0001f4e4',
-        'MLE': '\U0001f4be',
-        'RTE': '\U0001f4a5',
-        'WA': '\u2718',
+        'AC': '✔',
+        'TLE': '⏱',
+        'OLE': '📤',
+        'MLE': '💾',
+        'RTE': '💥',
+        'WA': '✘',
         'PAC': '~',
         'JE': '!',
     }
@@ -2034,26 +1181,21 @@ class SubtaskResultsTable:
         self._problem_name = problem_name
         self._timelim: float | None = None
         self._show_subtask_scores = show_subtask_scores
-        # Each entry: (category, sort_key, cells_list)
         self._rows: list[tuple[str, float, list]] = []        
         self._status: str = ''
-        # Cached rendered table; None means it must be rebuilt before next render.
         self._cached_table: Table | None = None
-        # Logging handlers whose .stream we redirect on __enter__ and restore on __exit__.
         self._saved_log_streams: dict[logging.StreamHandler, Any] = {}
         self.console = Console()
         self._live = Live(
             self,
             console=self.console,
             auto_refresh=False,
-            redirect_stdout=True,   # intercept sys.stdout writes
-            redirect_stderr=True,   # intercept sys.stderr writes
+            redirect_stdout=True,
+            redirect_stderr=True,
             vertical_overflow='visible',
         )
 
-    # --- rich renderable protocol -----------------------------------------
-
-    def __rich_console__(self, console, options):  # type: ignore[override]
+    def __rich_console__(self, console, options):
         if self._cached_table is None:
             self._cached_table = self._build_table()
         if self._status:
@@ -2082,7 +1224,6 @@ class SubtaskResultsTable:
             table.add_column(os.path.basename(group._datadir), justify='center', no_wrap=True)
         if self._is_scoring:
             table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
-        # Group rows by category (in defined order), sort within group by score desc.
         by_category: dict[str, list[tuple[float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
         for cat, score, cells in self._rows:
             by_category.setdefault(cat, []).append((score, cells))
@@ -2098,30 +1239,20 @@ class SubtaskResultsTable:
                 row_index += 1
         return table
 
-    # --- public interface --------------------------------------------------
-
     def set_status(self, msg: str) -> None:
-        """Show a progress message in the caption; triggers a redraw."""
         self._status = msg
         self._live.refresh()
 
     def set_timelim(self, timelim: float) -> None:
-        """Update the title with the computed time limit and force a redraw."""
         self._timelim = timelim
         self._cached_table = None
         self._live.refresh()
 
     def clear_status(self) -> None:
-        """No-op: keeps the last testcase name visible until the next one replaces it."""
+        pass
 
-    def __enter__(self) -> SubtaskResultsTable:
+    def __enter__(self) -> "SubtaskResultsTable":
         self._live.__enter__()
-        # After Live has replaced sys.stdout/stderr with proxies that route
-        # writes through the Rich Console, redirect any logging StreamHandlers
-        # that still point at the original real stdout/stderr.  Without this,
-        # colorlog (and anything else using the captured stream reference)
-        # would write directly to the terminal fd, corrupting the cursor
-        # position tracking that the Live display relies on.
         for handler in logging.root.handlers:
             if (
                 isinstance(handler, logging.StreamHandler)
@@ -2161,16 +1292,17 @@ class SubtaskResultsTable:
         cells: list = [sub_stem]
         for group in self._subtask_groups:
             res = group_results.get(group)
-            cells.append(self._subtask_cell(res) if res is not None else Text('\u00b7', style='bright_black'))
+            cells.append(self._subtask_cell(res) if res is not None else Text('·', style='bright_black'))
         if self._is_scoring:
-            cells.append(f'{result.score:.0f}' if result.score is not None else '\u2014')
+            cells.append(f'{result.score:.0f}' if result.score is not None else '—')
         sort_key = float(result.score) if result.score is not None else float('-inf')
         self._rows.append((category, sort_key, cells))
-        self._cached_table = None   # invalidate; will be rebuilt on next render
+        self._cached_table = None
         self._live.refresh()
 
 
 class Submissions(ProblemPart):
+
     # (verdict, directory, required)
     _VERDICTS: list[tuple[Verdict, str, bool]] = [
         ('AC', 'accepted', True),
@@ -2199,67 +1331,156 @@ class Submissions(ProblemPart):
         return 'submissions'
 
     def check_submission(
-        self,
-        sub,
-        context: Context,
-        expected_verdict: Verdict,
-        timelim: float,
-        timelim_high: float,
-        subtask_table: SubtaskResultsTable | None = None,
-        result_cache: ResultCache | None = None,
-    ) -> SubmissionResult:
-        category = expected_verdict  # preserve before possible 'PAC' → 'AC' change
+        self, sub, context: Context, expected_verdict: Verdict, timelim: float, timelim_high: float,
+        results_table: SubtaskResultsTable | None = None, category: str = 'AC'
+    ) -> list[SubmissionResult]:
         desc = f'{expected_verdict} submission {sub}'
-        partial = False
-        if expected_verdict == 'PAC':
-            expected_verdict = 'AC'
-            partial = True
-            # For partially accepted, we don't want to use them to lower bound the time limit, but we do want
-            # to warn if they're slow enough that they would have affected the time limit, had they been used
-            # to compute it.
-            timelim_low = timelim / self.problem.metadata.limits.time_multipliers.ac_to_time_limit
-        else:
-            timelim_low = timelim
+        partial = expected_verdict == 'PAC'
 
-        with Runner(self.problem, sub, context, timelim, timelim_low, timelim_high, subtask_table, result_cache) as runner:
-            result, result_low, result_high = self.problem.testdata.run_submission(sub, runner, context)
-            group_results = runner.group_results
+        judge = SubmissionJudge(
+            sub=sub,
+            output_validator=self.problem.output_validators.output_validator,
+            metadata=self.problem.metadata,
+            root=self.problem.testdata,
+            base_dir=Path(self.problem.tmpdir),
+            context=context,
+            diag=self._diag,
+            custom_grader=self.problem.graders._grader,
+        )
+        if context.executor is not None:
+            judge.precompute(timelim_high)
+        results_high = judge.judge(timelim_high)
+        if not results_high:
+            self.fatal('check_submission called, but found no test cases to run on.')
+        result_high = results_high[-1]
 
-        if result.verdict == 'AC' and expected_verdict == 'AC' and not partial and result.sample_failures:
-            res = result.sample_failures[0]
-            self.warning(f'{desc} got {res.verdict} on sample: {res}')
+        results = judge.judge(timelim)
+        result = results[-1]
 
-        if result_low.verdict != result_high.verdict or result_low.score != result_high.score:
-            r1, r2 = (
-                (result_low, result_high)
-                if result_low.verdict == result_high.verdict
-                else (result_low.verdict, result_high.verdict)
-            )
+        # Check if scores were outside of the range for any groups
+        if self.problem.is_scoring():
+            for r in results:
+                if r.score is not None and isinstance(r.test_node, TestCaseGroup):
+                    r.test_node.check_score_in_bounds(sub, r.score)
+
+        # Warn if AC (but not PAC) submissions fail on samples. It's not uncommon for sample cases to be
+        # ignored, so failing on them could be silent otherwise. Skip warning if the result isn't AC -
+        # then something worse has gone wrong, and we'll error later.
+        if expected_verdict == 'AC' and result.verdict == 'AC':
+            if sample_failure := self._find_sample_failure(results):
+                self.warning(f'{desc} got {sample_failure.verdict} on sample: {sample_failure}')
+
+        # Warn if a PAC submission would affect time limit, had it been use to compute the time limit. Only do this
+        # if it gets AC on the computed time limit, otherwise we have other warnings below.
+        if partial and result.verdict == 'AC':
+            self._warn_pac_too_slow(judge, results, timelim, desc)
+
+        if result.verdict != result_high.verdict or result.score != result_high.score:
             self.warning(
-                f'{desc} sensitive to time limit: limit of {timelim_low} secs -> {r1}, limit of {timelim_high} secs -> {r2}'
+                f'{desc} sensitive to time limit: limit of {timelim} secs -> {result}, limit of {timelim_high} secs -> {result_high}'
             )
 
+        required_verdict: Verdict = 'AC' if partial else expected_verdict
         if partial and self.fully_accepted(result):
-            self.warning(f'{desc} got {result}')
-        elif result.verdict == expected_verdict:
-            if subtask_table is None and not context.debug_mode:
+            self.warning(f'{desc} was fully accepted: {result}')
+        elif result.verdict == required_verdict:
+            if results_table is None and not getattr(context, 'debug_mode', False):
                 self.msg(f'   {desc} OK: {result}')
-            if expected_verdict == 'AC' and not partial and not self.fully_accepted(result) and self.full_score_finite():
+            if not partial and required_verdict == 'AC' and not self.fully_accepted(result) and self.full_score_finite():
                 # For some heuristic problems, this is expected. Thus, only warn.
                 self.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
-        elif result_high.verdict == expected_verdict and not (partial and self.fully_accepted(result_high)):
-            if subtask_table is None and not context.debug_mode:
+        elif result_high.verdict == required_verdict and not (partial and self.fully_accepted(result_high)):
+            if results_table is None and not context.debug_mode:
                 self.msg(f'   {desc} OK with extra time: {result_high}')
         else:
             self.error(f'{desc} got {result}', result_high.additional_info)
 
-        if subtask_table is not None:
-            subtask_table.add_row(sub, result, group_results, category)
+        if results_table is not None:
+            group_results = {r.test_node: r for r in results if getattr(r.test_node, 'is_group', False)}
+            results_table.add_row(sub, result, group_results, category)
 
-        if context.debug_mode:
-            result.group_results = dict(group_results)
+        if getattr(context, 'debug_mode', False):
+            result.group_results = {r.test_node: r for r in results if getattr(r.test_node, 'is_group', False)}
 
+        return results
+
+    def _find_sample_failure(self, results: list[SubmissionResult]) -> SubmissionResult | None:
+        for r in results:
+            if r.verdict != 'AC' and isinstance(r.test_node, TestCase) and r.test_node.is_in_sample_group():
+                return r
+        return None
+
+    def _warn_pac_too_slow(self, judge: SubmissionJudge, results: list[SubmissionResult], timelim: float, desc: str) -> None:
+        """Warn if a PAC submission is slow enough that it would have affected the time limit."""
+        runtime_without_affecting_tl = timelim / self.problem.metadata.limits.time_multipliers.ac_to_time_limit
+        if judge.judge(runtime_without_affecting_tl)[-1].verdict == 'AC':
+            return
+        for t in sorted(r.runtime for r in results if r.runtime > runtime_without_affecting_tl):
+            if judge.judge(t)[-1].verdict == 'AC':
+                self.warning(f'{desc} is slower than all AC submissions. It needs {t:.2f}s to get AC')
+                return
+
+    def _get_table_groups(self) -> list[TestCaseGroup]:
+        """Return the groups to show as columns: expand any root child that has subgroups."""
+        result = []
+        for group in self.problem.testdata.get_subgroups():
+            subgroups = group.get_subgroups()
+            if subgroups:
+                result.extend(subgroups)
+            else:
+                result.append(group)
         return result
+
+    def _print_results_table(self, all_submission_results: list[tuple[run.Program, list[SubmissionResult]]]) -> None:
+        groups = self._get_table_groups()
+        is_scoring = self.problem.is_scoring()
+
+        def cell_for_group(results: list[SubmissionResult], group: TestCaseGroup) -> str:
+            for r in results:
+                if r.test_node is group:
+                    if r.verdict == 'AC':
+                        if is_scoring and r.score is not None:
+                            score_str = f'{int(r.score)}' if r.score == int(r.score) else f'{r.score:.2f}'
+                            score_part = f'({score_str})'
+                        else:
+                            score_part = ''
+                        return f'AC{score_part}:{r.runtime:.2f}s'
+                    return r.verdict
+            return '-'
+
+        def cell_for_pts(results: list[SubmissionResult]) -> str:
+            score = results[-1].score
+            return f'{score:.0f}' if score is not None else '-'
+
+        def cell_for_time(results: list[SubmissionResult]) -> str:
+            t = results[-1].runtime
+            return f'{t:.2f}s' if t >= 0 else '-'
+
+        headers = ['Submission'] + [os.path.basename(g._datadir) for g in groups]
+        if is_scoring:
+            headers.append('Pts')
+        headers.append('Time')
+
+        rows = []
+        for sub, results in all_submission_results:
+            row = [sub.name]  # type: ignore
+            for g in groups:
+                row.append(cell_for_group(results, g))
+            if is_scoring:
+                row.append(cell_for_pts(results))
+            row.append(cell_for_time(results))
+            rows.append(row)
+
+        widths = [len(h) for h in headers]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+
+        self.msg('Submission results:')
+        indent = '   '
+        self.msg(indent + '  '.join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+        for row in rows:
+            self.msg(indent + '  '.join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
 
     def full_score_finite(self) -> bool:
         min_score, max_score = self.problem.testdata.get_score_range()
@@ -2272,74 +1493,6 @@ class Submissions(ProblemPart):
         min_score, max_score = self.problem.testdata.get_score_range()
         best_score = min_score if self.problem.metadata.legacy_grading.objective == 'min' else max_score
         return result.verdict == 'AC' and (not self.problem.is_scoring() or result.score == best_score)
-
-    def _print_debug_summary(
-        self,
-        debug_data: list[tuple[str, str, SubmissionResult]],
-        subtask_groups: list[TestCaseGroup],
-    ) -> None:
-        def compact_path(tc: TestCase) -> str:
-            path = tc.strip_path_prefix(tc._base)
-            if path.startswith('secret/'):
-                path = path[7:]
-            return path
-
-        console = Console()
-        vstyles = SubtaskResultsTable._VERDICT_STYLE
-
-        entries: list[tuple[str, str, SubmissionResult, list[tuple[TestCaseGroup, SubmissionResult]]]] = []
-        for sub_name, category, result in debug_data:
-            if result.group_results is None:
-                continue
-            fail_groups = []
-            if subtask_groups:
-                for g in subtask_groups:
-                    gr = result.group_results.get(g)
-                    if gr and gr.verdict != 'AC':
-                        fail_groups.append((g, gr))
-            has_failure = bool(fail_groups) or result.verdict != 'AC'
-            if not has_failure:
-                continue
-            entries.append((sub_name, category, result, fail_groups))
-
-        if not entries:
-            console.print('\n  [bold green]\u2714[/bold green] [green]All solutions behaved as expected[/green]\n')
-            return
-
-        console.print()
-        console.rule('[bold red]Failures[/bold red]', style='bright_black')
-
-        for sub_name, category, result, fail_groups in entries:
-            console.print()
-            cat_style = vstyles.get(category, 'white')
-            header = f'  [bold red]\u2718[/bold red] [bold white]{sub_name}[/bold white]  [{cat_style}]{category}[/{cat_style}]'
-            if category != result.verdict:
-                res_style = vstyles.get(result.verdict, 'white')
-                header += f' [dim]\u2192[/dim] [{res_style}]{result.verdict}[/{res_style}]'
-            console.print(header)
-
-            if fail_groups:
-                max_gname = max(len(os.path.basename(g._datadir)) for g, _ in fail_groups)
-                for group, gr in fail_groups:
-                    gname = os.path.basename(group._datadir)
-                    verdict = gr.verdict
-                    vs = vstyles.get(verdict, 'white')
-                    tc = gr.first_failure or gr.testcase
-                    tc_name = os.path.basename(tc._base) if tc else '?'
-                    console.print(f'    {gname:<{max_gname}}  [{vs}]{verdict:<4}[/{vs}] [dim]@[/dim] [dim]{tc_name}[/dim]')
-            elif result.verdict != 'AC':
-                tc = result.first_failure or result.testcase
-                tc_name = compact_path(tc) if tc else '?'
-                vs = vstyles.get(result.verdict, 'white')
-                console.print(f'    [{vs}]{result.verdict}[/{vs}] [dim]@ {tc_name}[/dim]')
-
-            if result.runtime >= 0 and result.runtime_testcase:
-                tc_path = compact_path(result.runtime_testcase)
-                console.print(f'    [dim]\u23f1 {result.runtime:.2f} @ {tc_path}[/dim]')
-
-        console.print()
-        console.rule(style='bright_black')
-        console.print()
 
     def start_background_work(self, context: Context) -> None:
         # Send off an early background compile job for each submission and
@@ -2381,11 +1534,15 @@ class Submissions(ProblemPart):
         if limits.time_limit is not None and context.fixed_timelim is not None:
             self.warning('There is a fixed time limit in problem.yaml, and you provided one on command line. Using command line.')
 
+        has_testcases = any(tc.matches_filter(context.data_filter) for tc in self.problem.testdata.get_all_testcases())
+        if not has_testcases:
+            self.warning('Found no test cases to run on. Did you filter them all out?')
+
+        all_submission_results: list[tuple[run.Program, list[SubmissionResult]]] = []
+
         secret_group = self.problem.testdata.get_subgroup('secret')
         sample_group = self.problem.testdata.get_subgroup('sample')
         subtask_groups = secret_group.get_subgroups() if secret_group else []
-        # For scoring problems with no explicit subtask subgroups, treat the
-        # entire secret group as a single column named "secret".
         if not subtask_groups and secret_group and self.problem.is_scoring():
             subtask_groups = [secret_group]
         table_groups = ([sample_group] if sample_group else []) + subtask_groups
@@ -2395,67 +1552,67 @@ class Submissions(ProblemPart):
             else contextlib.nullcontext()
         )
 
-        result_cache = ResultCache() if context.use_cache else None
         debug_data: list[tuple[str, str, SubmissionResult]] = []
 
         with _table_ctx as results_table:
-          for verdict in Submissions._VERDICTS:
-            acr = verdict[0]
-            if verdict[2] and not self._submissions[acr]:
-                self.error(f'Require at least one "{verdict[1]}" submission')
+            for verdict in Submissions._VERDICTS:
+                acr = verdict[0]
+                if verdict[2] and not self._submissions[acr]:
+                    self.error(f'Require at least one "{verdict[1]}" submission')
 
-            runtimes = []
+                runtimes = []
 
-            for sub in self._submissions[acr]:
-                sub_name = sub.name  # type: ignore
-                if context.submission_filter.search(os.path.join(verdict[1], sub_name)):
-                    self.info(f'Check {acr} submission {sub}')
+                for sub in self._submissions[acr]:
+                    sub_name = sub.name  # type: ignore
+                    if context.submission_filter.search(os.path.join(verdict[1], sub_name)):
+                        self.info(f'Check {acr} submission {sub}')
 
-                    if sub.code_size() > 1024 * limits.code:
-                        self.error(
-                            f'{acr} submission {sub} has size {sub.code_size() / 1024.0:.1f} kiB, exceeds code size limit of {limits.code} kiB'
-                        )
-                        continue
-
-                    success, msg = sub.compile()
-                    if not success:
-                        self.error(f'Compile error for {acr} submission {sub}', additional_info=msg)
-                        continue
-
-                    timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
-                    res = self.check_submission(sub, context, acr, timelim, timelim_high, results_table, result_cache)  # type: ignore[arg-type]
-                    runtimes.append(res.runtime)
-                    if context.debug_mode:
-                        debug_data.append((sub.name, acr, res))
-
-            if acr == 'AC':
-                if len(runtimes) > 0:
-                    lower_bound_runtime = max(runtimes)
-
-                # Helper function to format numbers with at most 3 decimals and dealing with None
-                def _f_n(number: float | None) -> str:
-                    return f'{round(number, 3):g}' if number is not None else '-'
-
-                if fixed_limit is not None and lower_bound_runtime is not None:
-                    if lower_bound_runtime * ac_to_time_limit > fixed_limit:
-                        self.error(
-                            f'Time limit fixed to {_f_n(fixed_limit)}, but slowest AC runs in {_f_n(lower_bound_runtime)} which is within a factor {_f_n(ac_to_time_limit)}.'
-                        )
-                    tl_from_subs, _ = self._compute_time_limit(None, lower_bound_runtime)
-                    if not math.isclose(fixed_limit, tl_from_subs):
-                        if results_table is None:
-                            self.msg(
-                                f'   Solutions give timelim of {_f_n(tl_from_subs)} seconds, but will use provided fixed limit of {_f_n(fixed_limit)} seconds instead'
+                        if sub.code_size() > 1024 * limits.code:
+                            self.error(
+                                f'{acr} submission {sub} has size {sub.code_size() / 1024.0:.1f} kiB, exceeds code size limit of {limits.code} kiB'
                             )
+                            continue
 
-                timelim, timelim_margin = self._compute_time_limit(fixed_limit, lower_bound_runtime)
-            
-                self.msg(
-                    f'   Slowest AC runtime: {_f_n(lower_bound_runtime)}, setting timelim to {_f_n(timelim)} secs, safety margin to {_f_n(timelim_margin)} secs'
-                )
-                self.problem._set_timelim(timelim)
-                if results_table is not None:
-                    results_table.set_timelim(timelim)
+                        success, msg = sub.compile()
+                        if not success:
+                            self.error(f'Compile error for {acr} submission {sub}', additional_info=msg)
+                            continue
+
+                        if has_testcases:
+                            timelim, timelim_high = self._compute_time_limit(fixed_limit, lower_bound_runtime)
+                            sub_results = self.check_submission(sub, context, acr, timelim, timelim_high, getattr(results_table, "add_row", None) and results_table, acr)
+                            res = sub_results[-1]
+                            runtimes.append(res.runtime)
+                            all_submission_results.append((sub, sub_results))
+                            if context.debug_mode:
+                                debug_data.append((sub.name, acr, res))
+
+                if acr == 'AC' and has_testcases:
+                    if len(runtimes) > 0:
+                        lower_bound_runtime = max(runtimes)
+
+                    def _f_n(number: float | None) -> str:
+                        return f'{round(number, 3):g}' if number is not None else '-'
+
+                    if fixed_limit is not None and lower_bound_runtime is not None:
+                        if lower_bound_runtime * ac_to_time_limit > fixed_limit:
+                            self.error(
+                                f'Time limit fixed to {_f_n(fixed_limit)}, but slowest AC runs in {_f_n(lower_bound_runtime)} which is within a factor {_f_n(ac_to_time_limit)}.'
+                            )
+                        tl_from_subs, _ = self._compute_time_limit(None, lower_bound_runtime)
+                        if not math.isclose(fixed_limit, tl_from_subs):
+                            if getattr(results_table, "add_row", None) is None:
+                                self.msg(
+                                    f'   Solutions give timelim of {_f_n(tl_from_subs)} seconds, but will use provided fixed limit of {_f_n(fixed_limit)} seconds instead'
+                                )
+
+                    timelim, timelim_margin = self._compute_time_limit(fixed_limit, lower_bound_runtime)
+                    self.msg(
+                        f'   Slowest AC runtime: {_f_n(lower_bound_runtime)}, setting timelim to {_f_n(timelim)} secs, safety margin to {_f_n(timelim_margin)} secs'
+                    )
+                    self.problem._set_timelim(timelim)
+                    if getattr(results_table, "set_timelim", None):
+                        results_table.set_timelim(timelim)
 
         if context.debug_mode and debug_data:
             self._print_debug_summary(debug_data, subtask_groups)
@@ -2463,23 +1620,19 @@ class Submissions(ProblemPart):
         return self._check_res
 
 
-PROBLEM_PARTS = ['config', 'data', 'graders', 'statement', 'submissions', 'validators']
-
-
 class Problem(ProblemAspect):
     """Represents a checkable problem"""
 
-    def __init__(self, probdir: str, args: argparse.Namespace):
+    def __init__(self, probdir: str, diagnostics: Diagnostics):
         self.probdir = os.path.realpath(probdir)
         self.shortname: str = os.path.basename(self.probdir)
+        self._diag = diagnostics
         super().__init__(self.shortname, self)
         self.language_config = languages.load_language_config(Path(self.probdir).parent)
         self.testcase_by_infile: dict[str, TestCase] = {}
         self.loaded = False
         self._metadata: metadata.Metadata | None = None
-        self._args = args
         self._timelim: float | None = None
-        self._counter_lock = threading.Lock()
 
     # Unfortunately must be before metadata, otherwise mypy gets confused about the type metadata.Metadata (feels like a bug)
     def _set_metadata(self, metadata: metadata.Metadata) -> None:  # Should only be called by ProblemConfig
@@ -2558,7 +1711,7 @@ class Problem(ProblemAspect):
     def __str__(self) -> str:
         return str(self.shortname)
 
-    def check(self) -> tuple[int, int]:
+    def check(self, context: Context) -> tuple[int, int]:
         """Loads and checks the problem package
 
         Loads the problem package and runs checks. After this has completed,
@@ -2575,10 +1728,6 @@ class Problem(ProblemAspect):
             self.load()
         except VerifyError:
             return self.errors, self.warnings
-
-        executor = ThreadPoolExecutor(self._args.threads) if self._args.threads > 1 else None
-        context = Context(self._args, executor)
-        context.validation_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
         try:
             part_mapping: dict[str, list] = {
@@ -2603,9 +1752,9 @@ class Problem(ProblemAspect):
             run.limit.check_limit_capabilities(self)
 
             parts = [
-                part for part in part_mapping if part in self._args.parts
-            ]  # Parts from _args in the order they appear in part_mapping
-            if executor:
+                part for part in part_mapping if part in context.parts
+            ]  # Parts from context in the order they appear in part_mapping
+            if context.executor:
                 for part in parts:
                     for item in part_mapping[part]:
                         item.start_background_work(context)
@@ -2620,7 +1769,7 @@ class Problem(ProblemAspect):
             # Wait for background work to finish before performing an rmtree on
             # the directory tree it uses.
             context.wait_for_background_work()
-            if context.validation_executor is not None:
+            if getattr(context, 'validation_executor', None) is not None:
                 context.validation_executor.shutdown(wait=True)
         return self.errors, self.warnings
 
@@ -2695,15 +1844,6 @@ class Problem(ProblemAspect):
                 if not regex.match(directory) and not _special_case_allowed_dirs(directory, reldir):
                     self.error(f"Invalid directory name '{directory}' in {reldir}, should match {regex.pattern}")
 
-    def bail_on_error(self) -> bool:
-        return self._args.bail_on_error
-
-    def consider_warnings_errors(self) -> bool:
-        return self._args.werror
-
-    def max_additional_info(self) -> int:
-        return self._args.max_additional_info
-
 
 def re_argument(s: str) -> Pattern[str]:
     try:
@@ -2747,6 +1887,7 @@ def argparser_basic_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def argparser() -> argparse.ArgumentParser:
+    # Default values here must be kept in sync with the defaults in Context.__init__().
     parser = argparse.ArgumentParser(description='Validate a problem package in the Kattis problem format.')
     parser.add_argument(
         '-s',
@@ -2794,22 +1935,34 @@ def argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def initialize_logging(args: argparse.Namespace) -> None:
-    fmt = '%(log_color)s%(levelname)s %(message)s'
-    colorlog.basicConfig(stream=sys.stdout, format=fmt, level=getattr(logging, args.log_level.upper()))
-
-
 def main() -> None:
     args = argparser().parse_args()
 
-    initialize_logging(args)
-
     total_errors = 0
     try:
+        context = Context(
+            data_filter=args.data_filter,
+            submission_filter=args.submission_filter,
+            fixed_timelim=args.fixed_timelim,
+            parts=args.parts,
+            threads=args.threads,
+            show_subtask_scores=getattr(args, 'score', False),
+            use_cache=getattr(args, 'cache', False),
+            debug_mode=getattr(args, 'debug', False),
+            validation_executor=concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+        )
         for problemdir in args.problemdir:
-            print(f'Loading problem {os.path.basename(os.path.realpath(problemdir))}')
-            with Problem(problemdir, args) as prob:
-                errors, warnings = prob.check()
+            shortname = os.path.basename(os.path.realpath(problemdir))
+            print(f'Loading problem {shortname}')
+            diag = LoggingDiagnostics.create(
+                shortname,
+                log_level=getattr(logging, args.log_level.upper()),
+                bail_on_error=args.bail_on_error,
+                warnings_as_errors=args.werror,
+                max_additional_info=args.max_additional_info,
+            )
+            with Problem(problemdir, diag) as prob:
+                errors, warnings = prob.check(context)
 
                 def p(x: int) -> str:
                     return '' if x == 1 else 's'
