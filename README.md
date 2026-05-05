@@ -8,6 +8,16 @@ format](https://www.kattis.com/problem-package-format/). The problem package
 specification is developed in the [problem package format
 repository](https://github.com/Kattis/problem-package-format).
 
+## Features of this fork
+
+This repository is a fork Kattis' `problemtools`. It improves support for larger problems with multiple subtasks:
+
+* **Live rich table:** Submission results are shown in a live-updating terminal table, with submissions as rows and test case groups as columns (arguably an improvement over Thore Husfeldt's `analyzetestgroups.sh`. Does not suppoer EXPECTED_GRADE though).
+* **Result caching:** Adds a `--cache` flag that caches results of running a particular submission on a test case cross-runs.
+* **Multithreaded input validators:** `-j` / `--threads` now work for input validators.
+* **Subtask scoring view:** The subtask table also supports `--score` flag to show per-subtask scores instead of runtimes.
+* **Compact debug mode:** Adds a `--debug` flag that shows only failures, including the first failing test case per group and the slowest test case. (this mode kinda sucks currently)
+
 
 ## Programs Provided
 
