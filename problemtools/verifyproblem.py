@@ -38,7 +38,7 @@ from . import statement_util
 from .context import Context, PROBLEM_PARTS
 from .diagnostics import Diagnostics, LoggingDiagnostics, VerifyError
 from .formatversion import FormatVersion, get_format_version
-from .judge import CacheKey, SubmissionJudge, SubmissionResult, Verdict, validate_output
+from .judge import CacheKey, SubmissionJudge, SubmissionResult, Verdict, parse_float_tolerances, validate_output
 from .version import add_version_arg
 
 from abc import ABC
@@ -1175,12 +1175,33 @@ class SubtaskResultsTable:
 
     _CATEGORY_ORDER: list[str] = ['AC', 'PAC', 'WA', 'RTE', 'TLE']
 
+    @classmethod
+    def _problem_float_tolerances(cls, groups: list[TestCaseGroup]) -> tuple[float | None, float | None]:
+        """Return (abs_tol, rel_tol) for the problem, taking legacy validator_flags as the baseline and
+        merging in any per-group output_validator_flags overrides. If different groups disagree we keep
+        the first non-None value seen — column display is informational, not authoritative."""
+        if not groups:
+            return None, None
+        legacy = groups[0]._problem.metadata.legacy_validator_flags.split()
+        abs_tol, rel_tol = parse_float_tolerances(legacy)
+        for g in groups:
+            g_flags = g.config.get('output_validator_flags', '').split()
+            g_abs, g_rel = parse_float_tolerances(g_flags)
+            if abs_tol is None and g_abs is not None:
+                abs_tol = g_abs
+            if rel_tol is None and g_rel is not None:
+                rel_tol = g_rel
+        return abs_tol, rel_tol
+
     def __init__(self, subtask_groups: list[TestCaseGroup], is_scoring: bool, problem_name: str = '', show_subtask_scores: bool = False) -> None:
         self._subtask_groups = subtask_groups
         self._is_scoring = is_scoring
         self._problem_name = problem_name
         self._timelim: float | None = None
         self._show_subtask_scores = show_subtask_scores
+        self._abs_tol, self._rel_tol = self._problem_float_tolerances(subtask_groups)
+        uses_default = bool(subtask_groups) and subtask_groups[0]._problem.output_validators.uses_default_validator()
+        self._show_precision = uses_default and (self._abs_tol is not None or self._rel_tol is not None)
         self._rows: list[tuple[str, float, list]] = []        
         self._status: str = ''
         self._cached_table: Table | None = None
@@ -1224,6 +1245,8 @@ class SubtaskResultsTable:
             table.add_column(os.path.basename(group._datadir), justify='center', no_wrap=True)
         if self._is_scoring:
             table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
+        if self._show_precision:
+            table.add_column('Precision', justify='right', style='bright_white', no_wrap=True)
         by_category: dict[str, list[tuple[float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
         for cat, score, cells in self._rows:
             by_category.setdefault(cat, []).append((score, cells))
@@ -1270,6 +1293,23 @@ class SubtaskResultsTable:
         self._saved_log_streams.clear()
         self._live.__exit__(*args)
 
+    def _format_precision(self, ratio: float | None) -> str:
+        """Render the per-submission precision (max tolerance fraction used over all testcases).
+
+        - With only abs_tol set: convert ratio back to raw |team-judge| (= ratio * abs_tol).
+        - With only rel_tol set: convert ratio back to raw relative error (= ratio * rel_tol).
+        - With both set: show the dimensionless ratio directly (fraction of the more-lenient
+          tolerance used at the worst token), since per-testcase the better metric was picked
+          and units may differ across testcases.
+        """
+        if ratio is None:
+            return '—'
+        if self._abs_tol is not None and self._rel_tol is None:
+            return f'{ratio * self._abs_tol:.1e}'
+        if self._rel_tol is not None and self._abs_tol is None:
+            return f'{ratio * self._rel_tol:.1e}'
+        return f'{ratio:.1e}'
+
     def _subtask_cell(self, res: SubmissionResult) -> Text:
         verdict = res.verdict
         style = self._VERDICT_STYLE.get(verdict, 'white')
@@ -1295,6 +1335,8 @@ class SubtaskResultsTable:
             cells.append(self._subtask_cell(res) if res is not None else Text('·', style='bright_black'))
         if self._is_scoring:
             cells.append(f'{result.score:.0f}' if result.score is not None else '—')
+        if self._show_precision:
+            cells.append(self._format_precision(result.precision))
         sort_key = float(result.score) if result.score is not None else float('-inf')
         self._rows.append((category, sort_key, cells))
         self._cached_table = None

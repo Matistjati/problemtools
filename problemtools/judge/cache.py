@@ -204,6 +204,7 @@ class ResultCache:
             additional_info=data.get('additional_info'),
         )
         res.runtime = cached_runtime
+        res.precision = data.get('precision')
         return res
 
     def store(
@@ -217,6 +218,7 @@ class ResultCache:
             'score': res_high.score,
             'reason': res_high.reason,
             'additional_info': res_high.additional_info,
+            'precision': res_high.precision,
             'timelim_high': timelim_high,
         }
         path = os.path.join(self._CACHE_DIR, f'{key}.json')

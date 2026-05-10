@@ -5,7 +5,7 @@ from .result import (
     Verdict,
 )
 from .submission_judge import SubmissionJudge
-from .validate import validate_output
+from .validate import parse_float_tolerances, validate_output
 
 __all__ = [
     'CacheKey',
@@ -13,5 +13,6 @@ __all__ = [
     'SubmissionResult',
     'Verdict',
     'execute_testcase',
+    'parse_float_tolerances',
     'validate_output',
 ]

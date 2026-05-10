@@ -226,6 +226,9 @@ class SubmissionJudge:
                 slowest = max(child_results, key=lambda r: r.runtime)
                 result.runtime = slowest.runtime
                 result.runtime_testcase = slowest.runtime_testcase
+                child_precisions = [r.precision for r in child_results if r.precision is not None]
+                if child_precisions:
+                    result.precision = max(child_precisions)
                 # The grader doesn't tell us why it gave a certain result. We still want to propagate reason
                 # and additional_info. As a heuristic, look for the last entry with the same verdict as the
                 # group got, and copy from there.

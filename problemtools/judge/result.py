@@ -27,6 +27,9 @@ class SubmissionResult:
         self.first_failure: TestCase | None = None
         self.first_failure_verdict: str | None = None
         self.group_results: dict[TestCaseGroup, SubmissionResult] | None = None
+        # Tolerance ratio (max over tokens & testcases of min(abs_err/abs_tol, rel_err/rel_tol)
+        # over the tolerances that are set). 0 means perfect match; 1 means right at the edge.
+        self.precision: float | None = None
 
     def __str__(self) -> str:
         verdict = self.verdict
