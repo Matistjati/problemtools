@@ -1,0 +1,6 @@
+Wrong answer on line 1 of output (corresponding to line 1 in answer file)
+Too large difference.
+ Judge: 0
+ User:  1
+ Absolute error: 1.000000e+00 (abs tolerance -1.000000e+00)
+ Relative error: undefined, judge value is 0 (rel tolerance 1.000000e-02)

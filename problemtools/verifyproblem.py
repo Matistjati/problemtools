@@ -843,13 +843,13 @@ class Attachments(ProblemPart):
 
 
 # Junk data. The validator should reject these cases
-_JUNK_CASES = [
+_JUNK_CASES: list[tuple[str, bytes]] = [
     ('an empty file', b''),
-    ('a binary file with random bytes', bytearray(random.Random(42).randbytes(1024))),
-    ('a text file with the ASCII characters 32 up to 127', bytearray(x for x in range(32, 127))),
+    ('a binary file with random bytes', random.Random(42).randbytes(1024)),
+    ('a text file with the ASCII characters 32 up to 127', bytes(range(32, 127))),
     (
         'a random text file with printable ASCII characters',
-        (lambda rng: bytearray(rng.choice(string.printable.encode('utf8')) for _ in range(200)))(random.Random(42)),
+        bytes(random.Random(42).choices(string.printable.encode('utf8'), k=200)),
     ),
 ]
 

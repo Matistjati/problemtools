@@ -48,6 +48,7 @@
 \RequirePackage{url}              % Urls
 \RequirePackage[normalem]{ulem}   % \sout
 \RequirePackage[colorlinks=true,implicit=false]{hyperref}
+\RequirePackage{color}            % Colored text
 \RequirePackage{longtable}        % Used by Pandoc
 \RequirePackage{booktabs}         % Used by Pandoc
 \ifplastex\else

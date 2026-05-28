@@ -216,8 +216,24 @@ int main(int argc, char **argv) {
 				// gone very wrong if we're dealing with floats so long we need to truncate anyway :)
 				judge_trunc = truncate(judge);
 				team_trunc = truncate(team);
-				wrong_answer("Too large difference.\n Judge: %s\n User: %s\n Difference: %le\n (abs tol %le rel tol %le)", 
-				             judge_trunc.c_str(), team_trunc.c_str(), jval-tval, float_abs_tol, float_rel_tol);
+				if (jval == 0.0) {
+					wrong_answer("Too large difference.\n"
+					             " Judge: %s\n"
+					             " User:  %s\n"
+					             " Absolute error: %le (abs tolerance %le)\n"
+					             " Relative error: undefined, judge value is 0 (rel tolerance %le)",
+					             judge_trunc.c_str(), team_trunc.c_str(),
+					             fabs(jval - tval), float_abs_tol, float_rel_tol);
+				} else {
+					wrong_answer("Too large difference.\n"
+					             " Judge: %s\n"
+					             " User:  %s\n"
+					             " Absolute error: %le (abs tolerance %le)\n"
+					             " Relative error: %le (rel tolerance %le)",
+					             judge_trunc.c_str(), team_trunc.c_str(),
+					             fabs(jval - tval), float_abs_tol,
+					             fabs(jval - tval) / fabs(jval), float_rel_tol);
+				}
 			}
 		} else if (case_sensitive) {
 			if (strcmp(judge.c_str(), team.c_str()) != 0) {
