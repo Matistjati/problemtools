@@ -188,9 +188,33 @@ class ProblemPart(ProblemAspect):
                 tc_path = compact_path(result.runtime_testcase)
                 console.print(f'    [dim]⏱ {result.runtime:.2f} @ {tc_path}[/dim]')
 
+            for label, val, tc in self._precision_debug_lines(subtask_groups, result):
+                tc_path = compact_path(tc) if tc and getattr(tc, '_base', None) else '?'
+                console.print(f'    [dim]± {label} {val:.1e} @ {tc_path}[/dim]')
+
         console.print()
         console.rule(style='bright_black')
         console.print()
+
+    @staticmethod
+    def _precision_debug_lines(
+        subtask_groups: list[TestCaseGroup], result: SubmissionResult,
+    ) -> list[tuple[str, float, TestCase | None]]:
+        """Yield (label, value, testcase) tuples to print under a debug entry. One line per
+        configured precision metric, matching the columns shown in the live table."""
+        abs_tol, rel_tol = SubtaskResultsTable._problem_float_tolerances(subtask_groups)
+        if not subtask_groups or not subtask_groups[0]._problem.output_validators.uses_default_validator():
+            return []
+        lines: list[tuple[str, float, TestCase | None]] = []
+        if abs_tol is not None and rel_tol is not None and abs_tol == rel_tol:
+            if result.max_best_err is not None:
+                lines.append(('precision', result.max_best_err, result.max_best_err_tc))
+        else:
+            if abs_tol is not None and result.max_abs_err is not None:
+                lines.append(('abs precision', result.max_abs_err, result.max_abs_err_tc))
+            if rel_tol is not None and result.max_rel_err is not None:
+                lines.append(('rel precision', result.max_rel_err, result.max_rel_err_tc))
+        return lines
 
     def start_background_work(self, context: Context) -> None:
         pass
@@ -1201,7 +1225,22 @@ class SubtaskResultsTable:
         self._show_subtask_scores = show_subtask_scores
         self._abs_tol, self._rel_tol = self._problem_float_tolerances(subtask_groups)
         uses_default = bool(subtask_groups) and subtask_groups[0]._problem.output_validators.uses_default_validator()
-        self._show_precision = uses_default and (self._abs_tol is not None or self._rel_tol is not None)
+        # Display mode:
+        #   'abs'    — only abs_tol; one "Abs precision" column
+        #   'rel'    — only rel_tol; one "Rel precision" column
+        #   'both'   — both set, equal values; one "Precision" column with per-token min
+        #   'split'  — both set, different values; two columns
+        #   None     — no precision column
+        if not uses_default:
+            self._precision_mode: str | None = None
+        elif self._abs_tol is not None and self._rel_tol is not None:
+            self._precision_mode = 'both' if self._abs_tol == self._rel_tol else 'split'
+        elif self._abs_tol is not None:
+            self._precision_mode = 'abs'
+        elif self._rel_tol is not None:
+            self._precision_mode = 'rel'
+        else:
+            self._precision_mode = None
         self._rows: list[tuple[str, float, list]] = []        
         self._status: str = ''
         self._cached_table: Table | None = None
@@ -1245,8 +1284,8 @@ class SubtaskResultsTable:
             table.add_column(os.path.basename(group._datadir), justify='center', no_wrap=True)
         if self._is_scoring:
             table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
-        if self._show_precision:
-            table.add_column('Precision', justify='right', style='bright_white', no_wrap=True)
+        for header in self._precision_headers():
+            table.add_column(header, justify='right', style='bright_white', no_wrap=True)
         by_category: dict[str, list[tuple[float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
         for cat, score, cells in self._rows:
             by_category.setdefault(cat, []).append((score, cells))
@@ -1293,22 +1332,31 @@ class SubtaskResultsTable:
         self._saved_log_streams.clear()
         self._live.__exit__(*args)
 
-    def _format_precision(self, ratio: float | None) -> str:
-        """Render the per-submission precision (max tolerance fraction used over all testcases).
+    def _precision_headers(self) -> list[str]:
+        if self._precision_mode == 'abs':
+            return ['Abs precision']
+        if self._precision_mode == 'rel':
+            return ['Rel precision']
+        if self._precision_mode == 'both':
+            return ['Precision']
+        if self._precision_mode == 'split':
+            return ['Abs precision', 'Rel precision']
+        return []
 
-        - With only abs_tol set: convert ratio back to raw |team-judge| (= ratio * abs_tol).
-        - With only rel_tol set: convert ratio back to raw relative error (= ratio * rel_tol).
-        - With both set: show the dimensionless ratio directly (fraction of the more-lenient
-          tolerance used at the worst token), since per-testcase the better metric was picked
-          and units may differ across testcases.
-        """
-        if ratio is None:
-            return '—'
-        if self._abs_tol is not None and self._rel_tol is None:
-            return f'{ratio * self._abs_tol:.1e}'
-        if self._rel_tol is not None and self._abs_tol is None:
-            return f'{ratio * self._rel_tol:.1e}'
-        return f'{ratio:.1e}'
+    @staticmethod
+    def _fmt(val: float | None) -> str:
+        return '—' if val is None else f'{val:.1e}'
+
+    def _precision_cells(self, result: SubmissionResult) -> list[str]:
+        if self._precision_mode == 'abs':
+            return [self._fmt(result.max_abs_err)]
+        if self._precision_mode == 'rel':
+            return [self._fmt(result.max_rel_err)]
+        if self._precision_mode == 'both':
+            return [self._fmt(result.max_best_err)]
+        if self._precision_mode == 'split':
+            return [self._fmt(result.max_abs_err), self._fmt(result.max_rel_err)]
+        return []
 
     def _subtask_cell(self, res: SubmissionResult) -> Text:
         verdict = res.verdict
@@ -1335,8 +1383,7 @@ class SubtaskResultsTable:
             cells.append(self._subtask_cell(res) if res is not None else Text('·', style='bright_black'))
         if self._is_scoring:
             cells.append(f'{result.score:.0f}' if result.score is not None else '—')
-        if self._show_precision:
-            cells.append(self._format_precision(result.precision))
+        cells.extend(self._precision_cells(result))
         sort_key = float(result.score) if result.score is not None else float('-inf')
         self._rows.append((category, sort_key, cells))
         self._cached_table = None

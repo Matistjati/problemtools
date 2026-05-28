@@ -27,9 +27,15 @@ class SubmissionResult:
         self.first_failure: TestCase | None = None
         self.first_failure_verdict: str | None = None
         self.group_results: dict[TestCaseGroup, SubmissionResult] | None = None
-        # Tolerance ratio (max over tokens & testcases of min(abs_err/abs_tol, rel_err/rel_tol)
-        # over the tolerances that are set). 0 means perfect match; 1 means right at the edge.
-        self.precision: float | None = None
+        # Float-tolerance precision tracking (default validator only). All three are max-over-tokens-
+        # then-max-over-testcases. None when the float-tolerance metric doesn't apply (custom
+        # validator, no float flags, or structural mismatch in a WA output).
+        self.max_abs_err: float | None = None  # max |judge - team|
+        self.max_abs_err_tc: TestCase | None = None
+        self.max_rel_err: float | None = None  # max |judge - team| / |judge|
+        self.max_rel_err_tc: TestCase | None = None
+        self.max_best_err: float | None = None  # max over tokens of min(abs_err, rel_err); both tols set
+        self.max_best_err_tc: TestCase | None = None
 
     def __str__(self) -> str:
         verdict = self.verdict

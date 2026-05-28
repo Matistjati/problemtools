@@ -51,46 +51,53 @@ def _read_tokens(path: Path) -> list[str]:
         return []
 
 
-def _compute_precision_ratio(team_path: Path, judge_path: Path, abs_tol: float | None, rel_tol: float | None) -> float | None:
-    """Per token, take the smaller of (abs_err / abs_tol, rel_err / rel_tol) using only the tolerances that
-    are set — the validator passes that token if either is <= 1, so the smaller of the two reflects the
-    metric the token "passed under". Return the max of those ratios over all tokens (and -∞ if no float
-    tokens were comparable). Result is dimensionless: <1 means within tolerance, =1 is exactly at the edge.
+def _compute_precision(
+    team_path: Path, judge_path: Path, both_tols_set: bool,
+) -> tuple[float, float, float] | None:
+    """Compute (max_abs_err, max_rel_err, max_best_err) over float-token pairs.
+
+    Returns None if the team output is structurally incompatible (different token count, or any
+    non-float token pair that doesn't string-match) — in those cases the failure isn't a
+    float-tolerance issue and a precision number would be misleading. max_best_err is 0 when
+    both_tols_set is False (it's only meaningful when both tolerances apply).
     """
-    if abs_tol is None and rel_tol is None:
-        return None
     judge_tokens = _read_tokens(judge_path)
     team_tokens = _read_tokens(team_path)
-    if not judge_tokens or not team_tokens:
+    if not judge_tokens or len(judge_tokens) != len(team_tokens):
         return None
-    max_ratio: float | None = None
-    n = min(len(judge_tokens), len(team_tokens), _PRECISION_MAX_TOKENS)
+    max_abs = 0.0
+    max_rel = 0.0
+    max_best = 0.0
+    saw_float_pair = False
+    n = min(len(judge_tokens), _PRECISION_MAX_TOKENS)
     for i in range(n):
+        j_str = judge_tokens[i]
+        t_str = team_tokens[i]
         try:
-            jval = float(judge_tokens[i])
-            tval = float(team_tokens[i])
+            jval = float(j_str)
+            tval = float(t_str)
         except ValueError:
+            # Default validator falls back to (case-insensitive) string compare for non-float tokens.
+            if j_str.lower() != t_str.lower():
+                return None
             continue
+        saw_float_pair = True
         abs_err = abs(jval - tval)
-        candidates: list[float] = []
-        if abs_tol is not None:
-            if abs_tol > 0:
-                candidates.append(abs_err / abs_tol)
-            else:
-                candidates.append(0.0 if abs_err == 0 else float('inf'))
-        if rel_tol is not None:
-            if jval == 0:
-                candidates.append(0.0 if abs_err == 0 else float('inf'))
-            elif rel_tol > 0:
-                candidates.append((abs_err / abs(jval)) / rel_tol)
-            else:
-                candidates.append(0.0 if abs_err == 0 else float('inf'))
-        if not candidates:
-            continue
-        ratio = min(candidates)
-        if max_ratio is None or ratio > max_ratio:
-            max_ratio = ratio
-    return max_ratio
+        if jval == 0:
+            rel_err = 0.0 if abs_err == 0 else float('inf')
+        else:
+            rel_err = abs_err / abs(jval)
+        if abs_err > max_abs:
+            max_abs = abs_err
+        if rel_err > max_rel:
+            max_rel = rel_err
+        if both_tols_set:
+            best = abs_err if abs_err < rel_err else rel_err
+            if best > max_best:
+                max_best = best
+    if not saw_float_pair:
+        return None
+    return max_abs, max_rel, max_best
 
 
 def _get_feedback(feedback_dir: Path) -> str | None:
@@ -187,10 +194,19 @@ def _validate_output(
         except OSError as e:
             diag.info(f'Failed to read validator output: {e}')
     result = _parse_validator_result(output_validator, status, feedback_dir, metadata)
-    if result.verdict == 'AC' and testcase._problem.output_validators.uses_default_validator():
+    if result.verdict in ('AC', 'WA') and testcase._problem.output_validators.uses_default_validator():
         abs_tol, rel_tol = parse_float_tolerances(flags)
         if abs_tol is not None or rel_tol is not None:
-            result.precision = _compute_precision_ratio(submission_output, testcase.ansfile_path, abs_tol, rel_tol)
+            both_set = abs_tol is not None and rel_tol is not None
+            triplet = _compute_precision(submission_output, testcase.ansfile_path, both_set)
+            if triplet is not None:
+                result.max_abs_err = triplet[0]
+                result.max_abs_err_tc = testcase
+                result.max_rel_err = triplet[1]
+                result.max_rel_err_tc = testcase
+                if both_set:
+                    result.max_best_err = triplet[2]
+                    result.max_best_err_tc = testcase
     return result
 
 

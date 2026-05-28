@@ -226,9 +226,19 @@ class SubmissionJudge:
                 slowest = max(child_results, key=lambda r: r.runtime)
                 result.runtime = slowest.runtime
                 result.runtime_testcase = slowest.runtime_testcase
-                child_precisions = [r.precision for r in child_results if r.precision is not None]
-                if child_precisions:
-                    result.precision = max(child_precisions)
+                for field in ('max_abs_err', 'max_rel_err', 'max_best_err'):
+                    best_child = None
+                    best_val: float | None = None
+                    for r in child_results:
+                        v = getattr(r, field)
+                        if v is None:
+                            continue
+                        if best_val is None or v > best_val:
+                            best_val = v
+                            best_child = r
+                    if best_child is not None:
+                        setattr(result, field, best_val)
+                        setattr(result, f'{field}_tc', getattr(best_child, f'{field}_tc'))
                 # The grader doesn't tell us why it gave a certain result. We still want to propagate reason
                 # and additional_info. As a heuristic, look for the last entry with the same verdict as the
                 # group got, and copy from there.

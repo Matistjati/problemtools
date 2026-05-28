@@ -204,7 +204,16 @@ class ResultCache:
             additional_info=data.get('additional_info'),
         )
         res.runtime = cached_runtime
-        res.precision = data.get('precision')
+        res.max_abs_err = data.get('max_abs_err')
+        res.max_rel_err = data.get('max_rel_err')
+        res.max_best_err = data.get('max_best_err')
+        # _tc is implicit at testcase scope: it's whatever testcase we just looked up.
+        if res.max_abs_err is not None:
+            res.max_abs_err_tc = testcase
+        if res.max_rel_err is not None:
+            res.max_rel_err_tc = testcase
+        if res.max_best_err is not None:
+            res.max_best_err_tc = testcase
         return res
 
     def store(
@@ -218,7 +227,9 @@ class ResultCache:
             'score': res_high.score,
             'reason': res_high.reason,
             'additional_info': res_high.additional_info,
-            'precision': res_high.precision,
+            'max_abs_err': res_high.max_abs_err,
+            'max_rel_err': res_high.max_rel_err,
+            'max_best_err': res_high.max_best_err,
             'timelim_high': timelim_high,
         }
         path = os.path.join(self._CACHE_DIR, f'{key}.json')
