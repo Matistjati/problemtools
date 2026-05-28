@@ -22,7 +22,6 @@ class Context:
         threads: int = 1,
         show_subtask_scores: bool = False,
         use_cache: bool = False,
-        debug_mode: bool = False,
         validation_executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.data_filter = data_filter
@@ -31,7 +30,6 @@ class Context:
         self.parts: list[str] = parts if parts is not None else list(PROBLEM_PARTS)
         self.show_subtask_scores = show_subtask_scores
         self.use_cache = use_cache
-        self.debug_mode = debug_mode
         self.executor: ThreadPoolExecutor | None = ThreadPoolExecutor(threads) if threads > 1 else None
         self.validation_executor = validation_executor
         self._background_work: list[concurrent.futures.Future[object]] = []

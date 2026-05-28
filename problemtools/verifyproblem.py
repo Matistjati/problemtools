@@ -9,6 +9,7 @@ import string
 import hashlib
 import collections
 import concurrent.futures
+import contextlib
 import os
 import re
 import shutil
@@ -123,98 +124,6 @@ class ProblemPart(ProblemAspect):
 
     def setup(self) -> None:
         pass
-
-    def _print_debug_summary(
-        self,
-        debug_data: list[tuple[str, str, SubmissionResult]],
-        subtask_groups: list[TestCaseGroup],
-    ) -> None:
-        def compact_path(tc: TestCase) -> str:
-            path = tc.strip_path_prefix(tc._base)
-            if path.startswith('secret/'):
-                path = path[7:]
-            return path
-
-        console = Console()
-        vstyles = SubtaskResultsTable._VERDICT_STYLE
-
-        entries: list[tuple[str, str, SubmissionResult, list[tuple[TestCaseGroup, SubmissionResult]]]] = []
-        for sub_name, category, result in debug_data:
-            if getattr(result, 'group_results', None) is None:
-                continue
-            fail_groups = []
-            if subtask_groups:
-                for g in subtask_groups:
-                    gr = result.group_results.get(g)
-                    if gr and gr.verdict != 'AC':
-                        fail_groups.append((g, gr))
-            has_failure = bool(fail_groups) or result.verdict != 'AC'
-            if not has_failure:
-                continue
-            entries.append((sub_name, category, result, fail_groups))
-
-        if not entries:
-            console.print('\n  [bold green]✔[/bold green] [green]All solutions behaved as expected[/green]\n')
-            return
-
-        console.print()
-        console.rule('[bold red]Failures[/bold red]', style='bright_black')
-
-        for sub_name, category, result, fail_groups in entries:
-            console.print()
-            cat_style = vstyles.get(category, 'white')
-            header = f'  [bold red]✘[/bold red] [bold white]{sub_name}[/bold white]  [{cat_style}]{category}[/{cat_style}]'
-            if category != result.verdict:
-                res_style = vstyles.get(result.verdict, 'white')
-                header += f' [dim]→[/dim] [{res_style}]{result.verdict}[/{res_style}]'
-            console.print(header)
-
-            if fail_groups:
-                max_gname = max(len(os.path.basename(g._datadir)) for g, _ in fail_groups)
-                for group, gr in fail_groups:
-                    gname = os.path.basename(group._datadir)
-                    verdict = gr.verdict
-                    vs = vstyles.get(verdict, 'white')
-                    tc = getattr(gr, 'first_failure', None) or getattr(gr, 'test_node', None)
-                    tc_name = os.path.basename(tc._base) if tc and getattr(tc, '_base', None) else '?'
-                    console.print(f'    {gname:<{max_gname}}  [{vs}]{verdict:<4}[/{vs}] [dim]@[/dim] [dim]{tc_name}[/dim]')
-            elif result.verdict != 'AC':
-                tc = getattr(result, 'first_failure', None) or getattr(result, 'test_node', None)
-                tc_name = compact_path(tc) if tc and getattr(tc, '_base', None) else '?'
-                vs = vstyles.get(result.verdict, 'white')
-                console.print(f'    [{vs}]{result.verdict}[/{vs}] [dim]@ {tc_name}[/dim]')
-
-            if result.runtime >= 0 and result.runtime_testcase:
-                tc_path = compact_path(result.runtime_testcase)
-                console.print(f'    [dim]⏱ {result.runtime:.2f} @ {tc_path}[/dim]')
-
-            for label, val, tc in self._precision_debug_lines(subtask_groups, result):
-                tc_path = compact_path(tc) if tc and getattr(tc, '_base', None) else '?'
-                console.print(f'    [dim]± {label} {val:.1e} @ {tc_path}[/dim]')
-
-        console.print()
-        console.rule(style='bright_black')
-        console.print()
-
-    @staticmethod
-    def _precision_debug_lines(
-        subtask_groups: list[TestCaseGroup], result: SubmissionResult,
-    ) -> list[tuple[str, float, TestCase | None]]:
-        """Yield (label, value, testcase) tuples to print under a debug entry. One line per
-        configured precision metric, matching the columns shown in the live table."""
-        abs_tol, rel_tol = SubtaskResultsTable._problem_float_tolerances(subtask_groups)
-        if not subtask_groups or not subtask_groups[0]._problem.output_validators.uses_default_validator():
-            return []
-        lines: list[tuple[str, float, TestCase | None]] = []
-        if abs_tol is not None and rel_tol is not None and abs_tol == rel_tol:
-            if result.max_best_err is not None:
-                lines.append(('precision', result.max_best_err, result.max_best_err_tc))
-        else:
-            if abs_tol is not None and result.max_abs_err is not None:
-                lines.append(('abs precision', result.max_abs_err, result.max_abs_err_tc))
-            if rel_tol is not None and result.max_rel_err is not None:
-                lines.append(('rel precision', result.max_rel_err, result.max_rel_err_tc))
-        return lines
 
     def start_background_work(self, context: Context) -> None:
         pass
@@ -1473,13 +1382,13 @@ class Submissions(ProblemPart):
         if partial and self.fully_accepted(result):
             self.warning(f'{desc} was fully accepted: {result}')
         elif result.verdict == required_verdict:
-            if results_table is None and not getattr(context, 'debug_mode', False):
+            if results_table is None:
                 self.msg(f'   {desc} OK: {result}')
             if not partial and required_verdict == 'AC' and not self.fully_accepted(result) and self.full_score_finite():
                 # For some heuristic problems, this is expected. Thus, only warn.
                 self.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
         elif result_high.verdict == required_verdict and not (partial and self.fully_accepted(result_high)):
-            if results_table is None and not context.debug_mode:
+            if results_table is None:
                 self.msg(f'   {desc} OK with extra time: {result_high}')
         else:
             self.error(f'{desc} got {result}', result_high.additional_info)
@@ -1487,9 +1396,6 @@ class Submissions(ProblemPart):
         if results_table is not None:
             group_results = {r.test_node: r for r in results if getattr(r.test_node, 'is_group', False)}
             results_table.add_row(sub, result, group_results, category)
-
-        if getattr(context, 'debug_mode', False):
-            result.group_results = {r.test_node: r for r in results if getattr(r.test_node, 'is_group', False)}
 
         return results
 
@@ -1641,8 +1547,6 @@ class Submissions(ProblemPart):
             else contextlib.nullcontext()
         )
 
-        debug_data: list[tuple[str, str, SubmissionResult]] = []
-
         with _table_ctx as results_table:
             for verdict in Submissions._VERDICTS:
                 acr = verdict[0]
@@ -1673,8 +1577,6 @@ class Submissions(ProblemPart):
                             res = sub_results[-1]
                             runtimes.append(res.runtime)
                             all_submission_results.append((sub, sub_results))
-                            if context.debug_mode:
-                                debug_data.append((sub.name, acr, res))
 
                 if acr == 'AC' and has_testcases:
                     if len(runtimes) > 0:
@@ -1702,9 +1604,6 @@ class Submissions(ProblemPart):
                     self.problem._set_timelim(timelim)
                     if getattr(results_table, "set_timelim", None):
                         results_table.set_timelim(timelim)
-
-        if context.debug_mode and debug_data:
-            self._print_debug_summary(debug_data, subtask_groups)
 
         return self._check_res
 
@@ -1963,11 +1862,6 @@ def argparser_basic_arguments(parser: argparse.ArgumentParser) -> None:
         help='cache testcase results across runs in /tmp/problemtools/ to speed up repeated verification',
     )
     parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='compact output showing only failures with first failing testcase per group and slowest testcase',
-    )
-    parser.add_argument(
         '--max_additional_info',
         type=int,
         default=15,
@@ -2037,7 +1931,6 @@ def main() -> None:
             threads=args.threads,
             show_subtask_scores=getattr(args, 'score', False),
             use_cache=getattr(args, 'cache', False),
-            debug_mode=getattr(args, 'debug', False),
             validation_executor=concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
         )
         for problemdir in args.problemdir:

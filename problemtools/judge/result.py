@@ -24,9 +24,6 @@ class SubmissionResult:
         self.runtime_testcase: TestCase | None = None
         self.runtime = -1.0
         self.validator_first = False  # Needed to work around interactive giving unreliable runtime on WA
-        self.first_failure: TestCase | None = None
-        self.first_failure_verdict: str | None = None
-        self.group_results: dict[TestCaseGroup, SubmissionResult] | None = None
         # Float-tolerance precision tracking (default validator only). All three are max-over-tokens-
         # then-max-over-testcases. None when the float-tolerance metric doesn't apply (custom
         # validator, no float flags, or structural mismatch in a WA output).

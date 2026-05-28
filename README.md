@@ -17,7 +17,6 @@ This repository is a fork Kattis' `problemtools`. It improves support for larger
 * **Multithreaded input validators:** `-j` / `--threads` now work for input validators.
 * **Subtask scoring view:** The subtask table also supports `--score` flag to show per-subtask scores instead of runtimes.
 * **Precision column:** For problems with `float_tolerance`, the subtask table adds a `Precision` column showing the largest error over all test cases.
-* **Compact debug mode:** Adds a `--debug` flag that shows only failures, including the first failing test case per group and the slowest test case. (this mode kinda sucks currently)
 
 
 ## Programs Provided

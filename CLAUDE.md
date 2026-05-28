@@ -61,7 +61,6 @@ New `verifyproblem` CLI flags (`argparser_basic_arguments` in `verifyproblem.py`
 - `--score` — show per-subtask **score** instead of runtime in the results table.
 - `--cache` — cache per-testcase results across runs in `/tmp/problemtools/cache` to speed up repeated
   verification.
-- `--debug` — compact output showing only failures (first failing testcase per group + slowest testcase).
 
 The features:
 
@@ -85,19 +84,16 @@ The features:
    `ThreadPoolExecutor` (sized to `os.cpu_count()`), with cancellation on `VerifyError`. (Master's
    `-j`/`--threads` only parallelized submission running.)
 
-4. **Float-precision column** (`parse_float_tolerances` / `_compute_precision_ratio` in
-   `judge/validate.py`, `precision` on `SubmissionResult`). For problems using the default validator
-   with `float_tolerance` / `float_absolute_tolerance` / `float_relative_tolerance`, computes, per AC
-   testcase, the worst-token tolerance ratio (`min(abs_err/abs_tol, rel_err/rel_tol)` over the set
-   tolerances), propagated up groups as a max. Shown as a `Precision` column. The parsing mirrors
-   `default_validator.cc`.
+4. **Float-precision column(s)** (`parse_float_tolerances` / `_compute_precision` in
+   `judge/validate.py`; `max_abs_err` / `max_rel_err` / `max_best_err` on `SubmissionResult`). For
+   problems using the default validator with `float_tolerance` / `float_absolute_tolerance` /
+   `float_relative_tolerance`, computes per-testcase the max absolute and relative errors over float
+   tokens (and, when both tolerances are set, the per-token `min(abs_err, rel_err)`), propagated up
+   groups as a max. The table shows `Abs precision`, `Rel precision`, a combined `Precision`, or both,
+   depending on which tolerances are configured (see `_precision_mode` in `SubtaskResultsTable`). The
+   parsing and comparison mirror `default_validator.cc`.
 
-5. **Compact debug mode** (`_print_debug_summary` in `verifyproblem.py`, `--debug`). Prints only
-   failing solutions, the first failing testcase per group, and the slowest testcase, using
-   `first_failure`/`first_failure_verdict`/`group_results` added to `SubmissionResult`. (Noted as rough
-   in the README — see `todo.md`.)
-
-6. **Thread-safe diagnostics** (`diagnostics.py`). `_Counts` now holds a `threading.Lock` so
+5. **Thread-safe diagnostics** (`diagnostics.py`). `_Counts` now holds a `threading.Lock` so
    error/warning counters are safe under the new concurrency.
 
 ## Conventions
@@ -106,4 +102,4 @@ The features:
   (`mypy.ini`, `py.typed`). `pre-commit` is configured (`.pre-commit-config.yaml`).
 - Match the surrounding style in `verifyproblem.py`: `ProblemAspect`/`ProblemPart` subclasses, `self.msg`/
   `self.warning`/`self.error` for output, `Context`-threaded flags.
-- `todo.md` tracks the fork's open items (e.g. show per-group worth in subtask tables; improve debug mode).
+- `todo.md` tracks the fork's open items (e.g. show per-group worth in subtask tables).

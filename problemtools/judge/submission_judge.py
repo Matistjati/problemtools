@@ -246,15 +246,6 @@ class SubmissionJudge:
                 if matching:
                     result.reason = matching.reason
                     result.additional_info = matching.additional_info
-                    
-                first_fail = next((r for r in child_results if r.verdict != 'AC'), None)
-                if first_fail is not None:
-                    if first_fail.test_node and getattr(first_fail.test_node, 'is_group', False):
-                        result.first_failure = first_fail.first_failure
-                        result.first_failure_verdict = first_fail.first_failure_verdict
-                    else:
-                        result.first_failure = first_fail.test_node
-                        result.first_failure_verdict = first_fail.verdict
 
         result.test_node = group
         return result
