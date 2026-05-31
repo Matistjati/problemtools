@@ -1150,7 +1150,7 @@ class SubtaskResultsTable:
             self._precision_mode = 'rel'
         else:
             self._precision_mode = None
-        self._rows: list[tuple[str, float, list]] = []        
+        self._rows: list[tuple[str, float, float, list]] = []
         self._status: str = ''
         self._cached_table: Table | None = None
         self._saved_log_streams: dict[logging.StreamHandler, Any] = {}
@@ -1195,16 +1195,17 @@ class SubtaskResultsTable:
             table.add_column('Score', justify='right', style='bright_white', no_wrap=True)
         for header in self._precision_headers():
             table.add_column(header, justify='right', style='bright_white', no_wrap=True)
-        by_category: dict[str, list[tuple[float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
-        for cat, score, cells in self._rows:
-            by_category.setdefault(cat, []).append((score, cells))
+        by_category: dict[str, list[tuple[float, float, list]]] = {cat: [] for cat in self._CATEGORY_ORDER}
+        for cat, score, max_runtime, cells in self._rows:
+            by_category.setdefault(cat, []).append((score, max_runtime, cells))
         groups_present = [cat for cat in self._CATEGORY_ORDER if by_category.get(cat)]
         row_index = 0
         for g_idx, cat in enumerate(groups_present):
-            cat_rows = sorted(by_category[cat], key=lambda x: x[0], reverse=True)
+            # Sort by score (higher first); break ties by max runtime (lower first).
+            cat_rows = sorted(by_category[cat], key=lambda x: (-x[0], x[1]))
             last_in_group = len(cat_rows) - 1
             is_last_group = g_idx == len(groups_present) - 1
-            for r_idx, (_, cells) in enumerate(cat_rows):
+            for r_idx, (_, _, cells) in enumerate(cat_rows):
                 end_section = (r_idx == last_in_group) and not is_last_group
                 table.add_row(*cells, style='on grey7' if row_index % 2 else '', end_section=end_section)
                 row_index += 1
@@ -1294,7 +1295,9 @@ class SubtaskResultsTable:
             cells.append(f'{result.score:.0f}' if result.score is not None else '—')
         cells.extend(self._precision_cells(result))
         sort_key = float(result.score) if result.score is not None else float('-inf')
-        self._rows.append((category, sort_key, cells))
+        runtimes = [res.runtime for res in group_results.values() if res is not None and res.runtime >= 0]
+        max_runtime = max(runtimes) if runtimes else float('inf')
+        self._rows.append((category, sort_key, max_runtime, cells))
         self._cached_table = None
         self._live.refresh()
 
