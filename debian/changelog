@@ -1,3 +1,63 @@
+kattis-problemtools (1.20260620) noble; urgency=medium
+
+  [ Gunnar Kreitz ]
+  * Support emojis in sample (with caveats) #378
+
+  [ Matistjati ]
+  * Fix multithreaded symlink crash
+  * Fix bug in natural_sort_le
+  * Set cwd when running input validators
+
+  [ Gunnar Kreitz ]
+  * Update github actions to latest versions
+  * Work around actions/checkout safe directory not working
+  * Create a Diagnostics interface with a default implementation to extract logic from verifyproblem #398
+  * Remove Problem constructor taking an ArgumentParser instance
+  * Move Context to a separate file #398
+  * Move SubmissionResult, Verdict, is_RTE, is_TLE to a new module, judge
+  * Add path to base class - all implementations set it
+  * Begin moving output validation to judge module
+  * Add functions in judge to execute one test case
+  * Replace run_submission_real with judge module
+  * Explicitly drop support for multiple output validators
+  * Drop OutputValidators.validate - call judge.validate_output directly.
+  * Add mildly cleaned up grader to judge/
+  * Add new implementation of judging
+  * Clean up old unused methods all_datasets()
+  * Plug in new SubmissionJudge to run submissions (temporarily breaking some of the output)
+  * Rip out old code for running submissions from verifyproblem (relaced by problemtools.judge)
+  * Remove TimeLimits - time limits are now just a simple float
+  * Clean up flow a bit when there are no test cases to run on
+  * Rename test_item => test_node which is at least a tad more descriptive
+  * Restore details when printing a SubmissionResult
+  * Repair Runing sub on testcase... message when stdout is a tty
+  * Refactor - extract _aggregate_group_result from _judge_group to simplify function
+  * Extract checks to simplify check_submission a bit
+  * Avoid deadlock in multithreaded runs if worker crashes
+  * Add a simple implementation of a table to present submission results per group #382
+
+  [ Matistjati ]
+  * Remove ghostscript message when converting PDFs
+
+  [ Gunnar Kreitz ]
+  * Fix partially_accepted warning being super spammy in some scenarios
+  * Show signal or exit code on RTE submissions #260
+
+  [ Matistjati ]
+  * Cleaner junk case constructions
+  * Support colored text in HTML rendering pipeline for LaTeX
+  * Fix interactive output validator flags
+  * Make default validator output relative error
+  * Update default validator float tests
+
+  [ Gunnar Kreitz ]
+  * Fix not parsing score.txt in 2025-09 packages
+  * Fix AC being shown as AC (0) on pass-fail problems #420
+  * Fix submission size computation
+  * Cancel queued up work on ctrl-c #425
+
+ -- Gunnar Kreitz <gkreitz@kattis.com>  Sat, 20 Jun 2026 15:21:20 +0200
+
 kattis-problemtools (1.20260305) noble; urgency=medium
 
   [ Gunnar Kreitz ]

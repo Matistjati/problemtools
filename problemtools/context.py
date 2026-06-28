@@ -43,5 +43,9 @@ class Context:
         assert self.executor
         self._background_work.append(self.executor.submit(job, *args, **kwargs))
 
+    def cancel_background_work(self) -> None:
+        for future in self._background_work:
+            future.cancel()
+
     def wait_for_background_work(self) -> None:
         concurrent.futures.wait(self._background_work)

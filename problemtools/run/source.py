@@ -58,6 +58,7 @@ class SourceCode(Program):
 
         # Copy all files
         rutil.add_files(path, self.path)
+        self._code_size = sum(os.path.getsize(f) for f in rutil.list_files_recursive(self.path))
         if include_dir is not None:
             include_dir = os.path.join(include_dir, self.language.lang_id)
             if os.path.isdir(include_dir):
@@ -77,7 +78,7 @@ class SourceCode(Program):
         self.binary = os.path.join(self.path, 'run')
 
     def code_size(self) -> int:
-        return sum(os.path.getsize(x) for x in self.src)
+        return self._code_size
 
     def do_compile(self) -> tuple[bool, str | None]:
         """Compile the source code.

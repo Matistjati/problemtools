@@ -146,7 +146,7 @@ def _parse_validator_result(
         return SubmissionResult('JE', reason='validator produced "score.txt" but problem does not have custom scoring activated')
 
     score: float | None = None
-    if metadata.is_custom_score_mandatory():
+    if metadata.is_custom_score_allowed():
         if score_file.is_file():
             try:
                 score = float(score_file.read_text())
@@ -154,7 +154,7 @@ def _parse_validator_result(
                 return SubmissionResult('JE', reason=f'failed to parse validator score: {e}')
         elif metadata.is_multi_pass() and (feedback_dir / 'nextpass.in').is_file():
             score = 0.0
-        else:
+        elif metadata.is_custom_score_mandatory():
             return SubmissionResult('JE', reason='problem has custom scoring but validator did not produce "score.txt"')
 
     return SubmissionResult('AC', score=score)

@@ -1759,6 +1759,11 @@ class Problem(ProblemAspect):
                     item.check(context)
         except VerifyError:
             pass
+        except KeyboardInterrupt:
+            # In multithreaded runs, we can queue up large chunks of work. If the
+            # user presses ctrl-c, we want to cancel that to exit quickly.
+            context.cancel_background_work()
+            raise
         finally:
             # Wait for background work to finish before performing an rmtree on
             # the directory tree it uses.

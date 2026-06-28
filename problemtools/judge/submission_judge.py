@@ -226,7 +226,8 @@ class SubmissionJudge:
             else:
                 grader_flags = group.config.get('grader_flags', '').split()
                 verdict, score = grade_group(child_results, grader, grader_flags, self._base_dir, self._diag)
-                result = SubmissionResult(verdict, score=score)
+                # The grader spec is a bit funky, forcing graders to return a score even for pass-fail
+                result = SubmissionResult(verdict, score=score if self._metadata.is_scoring() else None)
                 slowest = max(child_results, key=lambda r: r.runtime)
                 result.runtime = slowest.runtime
                 result.runtime_testcase = slowest.runtime_testcase
