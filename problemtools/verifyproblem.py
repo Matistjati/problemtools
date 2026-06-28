@@ -1298,6 +1298,7 @@ class SubtaskResultsTable:
         runtimes = [res.runtime for res in group_results.values() if res is not None and res.runtime >= 0]
         max_runtime = max(runtimes) if runtimes else float('inf')
         self._rows.append((category, sort_key, max_runtime, cells))
+        self._status = ''
         self._cached_table = None
         self._live.refresh()
 
@@ -1551,6 +1552,8 @@ class Submissions(ProblemPart):
         )
 
         with _table_ctx as results_table:
+            if getattr(results_table, "set_status", None):
+                context.status_callback = results_table.set_status
             for verdict in Submissions._VERDICTS:
                 acr = verdict[0]
                 if verdict[2] and not self._submissions[acr]:

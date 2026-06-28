@@ -23,6 +23,7 @@ class Context:
         show_subtask_scores: bool = False,
         use_cache: bool = False,
         validation_executor: ThreadPoolExecutor | None = None,
+        status_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.data_filter = data_filter
         self.submission_filter = submission_filter
@@ -32,6 +33,10 @@ class Context:
         self.use_cache = use_cache
         self.executor: ThreadPoolExecutor | None = ThreadPoolExecutor(threads) if threads > 1 else None
         self.validation_executor = validation_executor
+        # Reports transient per-testcase progress ("Running ... on ...").  When a live
+        # results table is active, it routes status through the table's caption instead
+        # of writing directly to stdout (which the table's stdout redirect would mangle).
+        self.status_callback = status_callback
         self._background_work: list[concurrent.futures.Future[object]] = []
 
     def submit_background_work(self, job: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> None:

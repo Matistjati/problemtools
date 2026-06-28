@@ -182,12 +182,16 @@ class SubmissionJudge:
                 all_results.extend(sub)
                 result = sub[-1]  # last element is the subgroup's own result
             else:
-                if sys.stdout.isatty():
+                status_callback = self._context.status_callback
+                msg = ''
+                if status_callback is not None:
+                    status_callback(f'Running {self._sub} on {item}...')
+                elif sys.stdout.isatty():
                     msg = f'Running {self._sub} on {item}...'
                     sys.stdout.write(msg)
                     sys.stdout.flush()
                 result = self._judge_testcase(item, timelim)
-                if sys.stdout.isatty():
+                if status_callback is None and msg:
                     sys.stdout.write('\b \b' * len(msg))
 
                 # Apply default score here - after we've entered it into the cache, as it may also be present in other groups with different defaults
