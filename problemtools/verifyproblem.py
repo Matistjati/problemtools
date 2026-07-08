@@ -1161,7 +1161,14 @@ class SubtaskResultsTable:
             auto_refresh=False,
             redirect_stdout=True,
             redirect_stderr=True,
-            vertical_overflow='visible',
+            # 'ellipsis' (not 'visible') while live: when the table is taller than the terminal,
+            # 'visible' makes position_cursor() try to move the cursor above the top of the screen
+            # to erase the previous frame. The terminal clamps that move, so the scrolled-off rows
+            # are never erased and every refresh stacks another full copy of the table. 'ellipsis'
+            # caps the live frame to the screen height (with a '...' hint), so in-place updates stay
+            # clean. Live.stop() forces 'visible' for the single final render, so the complete table
+            # still lands in the scrollback once the run finishes.
+            vertical_overflow='ellipsis',
         )
 
     def __rich_console__(self, console, options):
@@ -1542,7 +1549,9 @@ class Submissions(ProblemPart):
         secret_group = self.problem.testdata.get_subgroup('secret')
         sample_group = self.problem.testdata.get_subgroup('sample')
         subtask_groups = secret_group.get_subgroups() if secret_group else []
-        if not subtask_groups and secret_group and self.problem.is_scoring():
+        if not subtask_groups and secret_group:
+            # Pass-fail problems (and scoring problems without subgroups) keep bare testcases
+            # directly under secret. Show that group itself as a column instead of dropping it.
             subtask_groups = [secret_group]
         table_groups = ([sample_group] if sample_group else []) + subtask_groups
         _table_ctx: SubtaskResultsTable | contextlib.AbstractContextManager[None] = (
