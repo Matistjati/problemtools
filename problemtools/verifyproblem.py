@@ -16,6 +16,8 @@ import shutil
 import logging
 import tempfile
 import sys
+import threading
+import time
 import random
 import traceback
 import uuid
@@ -1108,6 +1110,17 @@ class SubtaskResultsTable:
 
     _CATEGORY_ORDER: list[str] = ['AC', 'PAC', 'WA', 'RTE', 'TLE']
 
+    # Terminal "synchronized output" (DEC private mode 2026). Bracketing a repaint in these makes
+    # supporting terminals (Windows Terminal, iTerm2, kitty, …) buffer the whole erase+redraw and
+    # apply it atomically, so the table swaps in one step instead of visibly blanking and refilling
+    # line by line — that line-by-line redraw is what flashes. Terminals that don't understand the
+    # mode silently ignore it.
+    _SYNC_BEGIN: str = '\x1b[?2026h'
+    _SYNC_END: str = '\x1b[?2026l'
+    # Coalesce bursts of per-testcase status updates: never repaint more than this often. Row/time-
+    # limit changes bypass it (force=True) since they are infrequent and worth showing immediately.
+    _MIN_PAINT_INTERVAL: float = 1.0 / 12
+
     @classmethod
     def _problem_float_tolerances(cls, groups: list[TestCaseGroup]) -> tuple[float | None, float | None]:
         """Return (abs_tol, rel_tol) for the problem, taking legacy validator_flags as the baseline and
@@ -1154,6 +1167,8 @@ class SubtaskResultsTable:
         self._status: str = ''
         self._cached_table: Table | None = None
         self._saved_log_streams: dict[logging.StreamHandler, Any] = {}
+        self._paint_lock = threading.Lock()
+        self._last_paint: float = 0.0
         self.console = Console()
         self._live = Live(
             self,
@@ -1218,14 +1233,36 @@ class SubtaskResultsTable:
                 row_index += 1
         return table
 
+    def _paint(self, *, force: bool) -> None:
+        """Repaint the live table, bracketed in synchronized-output markers so the redraw is atomic
+        (no flashing). Non-forced paints are throttled to _MIN_PAINT_INTERVAL so that a flood of
+        per-testcase status updates coalesces into a calm, readable cadence instead of flickering."""
+        with self._paint_lock:
+            now = time.monotonic()
+            if not force and now - self._last_paint < self._MIN_PAINT_INTERVAL:
+                return
+            self._last_paint = now
+            sync = self.console.is_terminal
+            file = self.console.file
+            try:
+                if sync:
+                    file.write(self._SYNC_BEGIN)
+                    file.flush()
+                self._live.refresh()
+            finally:
+                if sync:
+                    file.write(self._SYNC_END)
+                    file.flush()
+
     def set_status(self, msg: str) -> None:
         self._status = msg
-        self._live.refresh()
+        self._paint(force=False)
 
     def set_timelim(self, timelim: float) -> None:
-        self._timelim = timelim
-        self._cached_table = None
-        self._live.refresh()
+        with self._paint_lock:
+            self._timelim = timelim
+            self._cached_table = None
+        self._paint(force=True)
 
     def clear_status(self) -> None:
         pass
@@ -1304,10 +1341,11 @@ class SubtaskResultsTable:
         sort_key = float(result.score) if result.score is not None else float('-inf')
         runtimes = [res.runtime for res in group_results.values() if res is not None and res.runtime >= 0]
         max_runtime = max(runtimes) if runtimes else float('inf')
-        self._rows.append((category, sort_key, max_runtime, cells))
-        self._status = ''
-        self._cached_table = None
-        self._live.refresh()
+        with self._paint_lock:
+            self._rows.append((category, sort_key, max_runtime, cells))
+            self._status = ''
+            self._cached_table = None
+        self._paint(force=True)
 
 
 class Submissions(ProblemPart):
