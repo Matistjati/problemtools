@@ -4,3 +4,4 @@ PyYAML
 plasTeX>=3.0
 pydantic>=2.11
 rich>=13.0
+checktestdata>=2026.7.1

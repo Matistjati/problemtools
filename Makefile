@@ -1,13 +1,8 @@
-all: checktestdata
+all:
 	make -C support
 
-builddeb: checktestdata
+builddeb:
 	dpkg-buildpackage -us -uc -tc -b
-
-checktestdata: support/checktestdata/bootstrap
-
-support/checktestdata/bootstrap:
-	git submodule update --init
 
 clean:
 	make -C support clean

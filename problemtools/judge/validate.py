@@ -136,11 +136,12 @@ def _parse_validator_result(
             additional_info=_get_feedback(feedback_dir),
         )
 
-    if ret == 43:
-        return SubmissionResult('WA', additional_info=_get_feedback(feedback_dir))
-
-    # ret == 42 (AC); check score handling
     score_file = feedback_dir / 'score.txt'
+
+    if ret == 43:
+        if score_file.is_file():
+            return SubmissionResult('JE', reason='validator produced "score.txt" on a WA verdict')
+        return SubmissionResult('WA', additional_info=_get_feedback(feedback_dir))
 
     if not metadata.is_custom_score_allowed() and score_file.is_file():
         return SubmissionResult('JE', reason='validator produced "score.txt" but problem does not have custom scoring activated')
@@ -174,6 +175,10 @@ def _validate_output(
     flags = testcase.output_validator_flags
     val_timelim = metadata.limits.validation_time
     val_memlim = metadata.limits.validation_memory
+
+    output_size = os.path.getsize(submission_output) / 1024.0 / 1024.0
+    if output_size > metadata.limits.output:
+        return SubmissionResult('OLE', reason=f'output ({output_size:.1f} Mb) exceeds output limit ({metadata.limits.output} Mb)')
 
     if not output_validator.compile()[0]:
         return SubmissionResult('JE', reason=f'output validator {output_validator} failed to compile')

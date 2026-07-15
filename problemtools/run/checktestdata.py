@@ -3,15 +3,12 @@ verification language (https://github.com/DOMjudge/checktestdata)
 """
 
 import os
+import sys
 from .executable import Executable
-from .errors import ProgramError
-from .tools import get_tool_path
 
 
 class Checktestdata(Executable):
     """Wrapper class for running Checktestdata scripts."""
-
-    _CTD_PATH = get_tool_path('checktestdata')
 
     def __init__(self, path):
         """Create a Checktestdata wrapper.
@@ -19,13 +16,11 @@ class Checktestdata(Executable):
         Args:
             path (str): path to .ctd source file
         """
-        if Checktestdata._CTD_PATH is None:
-            raise ProgramError('Could not locate the Checktestdata program to run %s' % path)
-        super().__init__(Checktestdata._CTD_PATH, args=[path])
+        super().__init__(sys.executable, args=['-m', 'checktestdata', path])
 
     def __str__(self) -> str:
         """String representation"""
-        return '%s' % (self.args[0])
+        return '%s' % (self.args[-1])
 
     def do_compile(self) -> tuple[bool, str | None]:
         """Syntax-check the Checktestdata script

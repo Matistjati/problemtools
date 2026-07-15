@@ -5,7 +5,6 @@ import subprocess
 
 import setuptools
 import setuptools.command.build
-import setuptools.command.sdist
 
 
 class BuildSupport(setuptools.Command):
@@ -27,22 +26,6 @@ class BuildSupport(setuptools.Command):
         subprocess.check_call(command)
 
 
-class CheckoutChecktestdata(setuptools.Command):
-    """A custom command to build the support programs."""
-
-    description = 'checkout the git submodule for checktestdata (via make)'
-
-    def initialize_options(self) -> None:
-        pass
-
-    def finalize_options(self) -> None:
-        pass
-
-    def run(self):
-        command = ['make', 'checktestdata']
-        subprocess.check_call(command)
-
-
 # It's *very* unclear from setuptools' documentation what the best way to do this is.
 #
 # I think that the ideal way would be to insert BuildSupport as a SubCommand
@@ -55,20 +38,9 @@ class build(setuptools.command.build.build):
         super().run()
 
 
-# To make python -m build work from a fresh checkout, we also need to hook sdist to
-# do a git submodule checkout so that the source code for checktestdata is included
-# in the sdist (an alternative approach would be to include .git in the sdist (eww).
-class sdist(setuptools.command.sdist.sdist):
-    def run(self):
-        self.run_command('checkout_checktestdata')
-        super().run()
-
-
 setuptools.setup(
     cmdclass={
         'build_support': BuildSupport,
         'build': build,
-        'checkout_checktestdata': CheckoutChecktestdata,
-        'sdist': sdist,
     },
 )

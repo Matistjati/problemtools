@@ -19,6 +19,7 @@ dependencies = [
     "PyYAML",
     "plasTeX>=3.0",
     "pydantic>=2.11",
+    "checktestdata>=2026.7.1",
 ]
 dynamic = [ "version" ]
 

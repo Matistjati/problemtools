@@ -1,3 +1,0 @@
-[submodule "checktestdata"]
-	path = support/checktestdata
-	url = https://github.com/DOMjudge/checktestdata

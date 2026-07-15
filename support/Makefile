@@ -1,8 +1,7 @@
 PACKAGE=problemtools
-CONF=checktestdata/config.mk
-PROGRAMS=checktestdata default_validator interactive
+PROGRAMS=default_validator interactive
 
-all: $(CONF)
+all:
 	$(foreach prog,$(PROGRAMS),$(MAKE) -C $(prog) &&) true
 
 install: all
@@ -12,14 +11,5 @@ install: all
 	cp viva/viva.jar $(DESTDIR)
 	install viva/viva.sh $(DESTDIR)
 
-$(CONF): checktestdata/bootstrap
-	cd checktestdata && ./bootstrap
-
-checktestdata/bootstrap:
-	git submodule update --init
-
 clean:
 	$(foreach prog,$(PROGRAMS),$(MAKE) -C $(prog) clean;)
-
-distclean: clean
-	rm -f $(CONF)
