@@ -1,15 +1,14 @@
 """Abstract base class for programs."""
 
+import logging
 import os
-from . import limit
 import resource
 import signal
-import logging
 import threading
-
-from .errors import ProgramError
-
 from abc import ABC, abstractmethod
+
+from . import limit
+from .errors import ProgramError
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +18,6 @@ class Program(ABC):
 
     def __init__(self) -> None:
         self.path: str = ''
-        self.runtime = 0
         self._compile_lock = threading.Lock()
         self._compile_result: tuple[bool, str | None] | None = None
 
@@ -39,7 +37,7 @@ class Program(ABC):
             args (list of str): additional command-line arguments to
                 pass to the program
             timelim (int): CPU time limit in seconds
-            memlim (int): memory limit in MB
+            memlim (int): memory limit in MiB
 
         Returns:
             pair (status, runtime):
@@ -55,8 +53,6 @@ class Program(ABC):
             memlim = None
 
         status, runtime = self.__run_wait(runcmd + args, infile, outfile, errfile, timelim, memlim, work_dir)
-
-        self.runtime = max(self.runtime, runtime)
 
         return status, runtime
 

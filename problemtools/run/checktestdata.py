@@ -4,17 +4,18 @@ verification language (https://github.com/DOMjudge/checktestdata)
 
 import os
 import sys
+
 from .executable import Executable
 
 
 class Checktestdata(Executable):
     """Wrapper class for running Checktestdata scripts."""
 
-    def __init__(self, path):
+    def __init__(self, path: str):
         """Create a Checktestdata wrapper.
 
         Args:
-            path (str): path to .ctd source file
+            path: path to .ctd source file
         """
         super().__init__(sys.executable, args=['-m', 'checktestdata', path])
 
@@ -54,7 +55,7 @@ class Checktestdata(Executable):
                 runtime (float): runtime of the Checktestdata process
                     in seconds
         """
-        (status, runtime) = super(Checktestdata, self).run(
+        (status, runtime) = super().run(
             infile=infile, outfile=outfile, errfile=errfile, args=args, timelim=timelim, memlim=memlim, work_dir=work_dir
         )
         # This is ugly, switches the accept exit status and our accept

@@ -3,8 +3,9 @@ verification language (http://viva.vanb.org/).
 """
 
 import os
-from .executable import Executable
+
 from .errors import ProgramError
+from .executable import Executable
 from .tools import get_tool_path
 
 
@@ -13,11 +14,11 @@ class Viva(Executable):
 
     _VIVA_PATH = get_tool_path('viva.sh')
 
-    def __init__(self, path):
+    def __init__(self, path: str):
         """Create a VIVA wrapper.
 
         Args:
-            path (str): path to .viva source file
+            path: path to .viva source file
         """
         if Viva._VIVA_PATH is None:
             raise ProgramError('Could not locate the VIVA program to run %s' % path)
@@ -62,7 +63,7 @@ class Viva(Executable):
         if infile != '/dev/null':
             args = args + [infile]
 
-        (status, runtime) = super(Viva, self).run(
+        (status, runtime) = super().run(
             outfile=outfile, errfile=errfile, args=args, timelim=timelim, memlim=memlim, work_dir=work_dir
         )
         # This is ugly, switches the accept exit status and our accept

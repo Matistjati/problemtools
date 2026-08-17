@@ -1,53 +1,47 @@
 #! /usr/bin/env python3
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
-import math
-import glob
-import string
-import hashlib
 import collections
 import concurrent.futures
 import contextlib
+import difflib
+import glob
+import hashlib
+import logging
+import math
 import os
+import random
 import re
 import shutil
-import logging
-import tempfile
+import string
 import sys
+import tempfile
 import threading
 import time
-import random
 import traceback
 import uuid
-import difflib
+from abc import ABC
+from collections.abc import Callable
+from functools import cached_property
 from pathlib import Path
+from re import Match, Pattern
+from typing import Any, ClassVar, Literal, ParamSpec, TypeVar
 
 import yaml
-from rich.table import Table
+from pydantic import ValidationError
+from rich import box as rich_box
 from rich.console import Console
 from rich.live import Live
+from rich.table import Table
 from rich.text import Text
-from rich import box as rich_box
 
-from . import config
-from . import languages
-from . import metadata
-from . import problem2html
-from . import problem2pdf
-from . import run
-from . import statement_util
-from .context import Context, PROBLEM_PARTS
+from . import checks, config, languages, metadata, model, problem2html, problem2pdf, run, statement_util
+from .context import PROBLEM_PARTS, Context
 from .diagnostics import Diagnostics, LoggingDiagnostics, VerifyError
 from .formatversion import FormatVersion, get_format_version
 from .judge import CacheKey, SubmissionJudge, SubmissionResult, Verdict, parse_float_tolerances, validate_output
 from .version import add_version_arg
-
-from abc import ABC
-from functools import cached_property
-from typing import Any, Callable, ClassVar, Literal, Pattern, Match, ParamSpec, TypeVar
-from pydantic import ValidationError
 
 random.seed(42)
 
@@ -163,10 +157,10 @@ class TestCase(ProblemAspect):
     def check_size_limits(self, filename: str) -> None:
         filesize = os.path.getsize(filename) / 1024.0 / 1024.0
         if filesize > 1000:
-            self.error(f'The file {filename} ({filesize:.1f} Mb) is larger than 1000 Mb and can not be installed.')
+            self.error(f'The file {filename} ({filesize:.1f} MiB) is larger than 1000 MiB and can not be installed.')
         elif filesize > 100:
             self.warning(
-                f'The file {filename} ({filesize:.1f} Mb) is larger than 100 Mb. This may cause performance issues and is not recommended.'
+                f'The file {filename} ({filesize:.1f} MiB) is larger than 100 MiB. This may cause performance issues and is not recommended.'
             )
 
     def strip_path_prefix(self, path: str) -> str:
@@ -212,11 +206,11 @@ class TestCase(ProblemAspect):
         outputlim = self._problem.metadata.limits.output
         if anssize > outputlim:
             self.error(
-                f'Answer file ({anssize:.1f} Mb) is larger than output limit ({outputlim} Mb), you need to increase output limit'
+                f'Answer file ({anssize:.1f} MiB) is larger than output limit ({outputlim} MiB), you need to increase output limit'
             )
         elif 2 * anssize > outputlim:
             self.warning(
-                f'Answer file ({anssize:.1f} Mb) is within 50% of output limit ({outputlim} Mb), you might want to increase output limit'
+                f'Answer file ({anssize:.1f} MiB) is within 50% of output limit ({outputlim} MiB), you might want to increase output limit'
             )
         if not self._problem.is_interactive() and not self._problem.is_multi_pass():
             val_res = validate_output(
@@ -438,7 +432,7 @@ class TestCaseGroup(ProblemAspect):
                         hashes[filehash].append(os.path.relpath(filepath, self._problem.probdir))
             for _, files in hashes.items():
                 if len(files) > 1:
-                    self.warning(f"Identical input files: '{str(files)}'")
+                    self.warning(f"Identical input files: '{files!s}'")
 
         infiles = glob.glob(os.path.join(self._datadir, '*.in'))
         ansfiles = glob.glob(os.path.join(self._datadir, '*.ans'))
@@ -565,7 +559,7 @@ class ProblemStatement(ProblemPart):
 
         for lang, files in self.statements.items():
             if len(files) > 1:
-                self.error(f'Found multiple statements in the same language {lang}: {", ".join((file.name for file in files))}')
+                self.error(f'Found multiple statements in the same language {lang}: {", ".join(file.name for file in files)}')
 
             if lang not in self.problem.metadata.name:
                 self.error(f'No problem name given in language {lang}')
@@ -619,7 +613,7 @@ class ProblemConfig(ProblemPart):
             self._metadata, self._origdata = metadata.load_metadata(Path(self.problem.probdir))
             self.problem._set_metadata(self._metadata)
         except ValidationError as e:
-            error_str = '\n'.join([f'    {"->".join((str(loc) for loc in err["loc"]))}: {err["msg"]}' for err in e.errors()])
+            error_str = '\n'.join([f'    {"->".join(str(loc) for loc in err["loc"])}: {err["msg"]}' for err in e.errors()])
             self.fatal(f'Failed parsing problem.yaml. Found {len(e.errors())} errors:\n{error_str}')
         except Exception as e:
             self.fatal(f'Failed loading problem configuration: {e}')
@@ -733,7 +727,7 @@ class Attachments(ProblemPart):
     def setup(self):
         attachments_dir = Path(self.problem.probdir) / 'attachments'
         self.attachments = [p for p in attachments_dir.iterdir()] if attachments_dir.is_dir() else []
-        self.debug(f'Adding attachments {str(self.attachments)}')
+        self.debug(f'Adding attachments {self.attachments!s}')
 
     def check(self, context: Context) -> bool:
         if self._check_res is not None:
@@ -1082,7 +1076,6 @@ class OutputValidators(ProblemPart):
         return self._check_res
 
 
-
 class SubtaskResultsTable:
     """Live-updating table: one row per submission, one column per subtask."""
 
@@ -1348,6 +1341,30 @@ class SubtaskResultsTable:
         self._paint(force=True)
 
 
+class Includes(ProblemPart):
+    """Seam to integrate a model + checks setup into verifyproblem in a somewhat clean way"""
+
+    PART_NAME = 'includes'
+
+    def setup(self):
+        self.includes = model.load_includes(Path(self.problem.probdir), self.problem.language_config)
+
+    def check(self, context: Context) -> bool:
+        if self._check_res is not None:
+            return self._check_res
+        self._check_res = True
+
+        errors_before = self.errors
+        checks.check_includes(self.includes, self.problem.language_config, self.problem.format, self._diag)
+        if self.errors > errors_before:
+            self._check_res = False
+
+        return self._check_res
+
+    def __str__(self) -> str:
+        return 'includes'
+
+
 class Submissions(ProblemPart):
 
     # (verdict, directory, required)
@@ -1370,7 +1387,7 @@ class Submissions(ProblemPart):
                 os.path.join(srcdir, verdict[1]),
                 language_config=self.problem.language_config,
                 work_dir=self.problem.tmpdir,
-                include_dir=os.path.join(self.problem.probdir, 'include'),
+                includes=self.problem.includes.includes,
             )
         return {}
 
@@ -1743,6 +1760,8 @@ class Problem(ProblemAspect):
         self.output_validators = OutputValidators(self)
         self.graders = Graders(self)
         self.testdata = TestCaseGroup(self, os.path.join(self.probdir, 'data'))
+        self.includes = Includes(self)
+        # Submissions.setup() reads self.includes.includes, so includes must be loaded first.
         self.submissions = Submissions(self)
         self.loaded = True
 
@@ -1781,7 +1800,7 @@ class Problem(ProblemAspect):
                 'validators': [self.input_validators, self.output_validators],
                 'graders': [self.graders],
                 'data': [self.testdata],
-                'submissions': [self.submissions],
+                'submissions': [self.includes, self.submissions],
             }
             assert sorted(part_mapping.keys()) == sorted(PROBLEM_PARTS), 'part_mapping and PROBLEM_PARTS must be kept in sync'
 
