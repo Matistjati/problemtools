@@ -1332,7 +1332,9 @@ class SubtaskResultsTable:
             cells.append(f'{result.score:.0f}' if result.score is not None else '—')
         cells.extend(self._precision_cells(result))
         sort_key = float(result.score) if result.score is not None else float('-inf')
-        runtimes = [res.runtime for res in group_results.values() if res is not None and res.runtime >= 0]
+        runtimes = [
+            res.runtime for res in group_results.values() if res is not None and res.verdict == 'AC' and res.runtime >= 0
+        ]
         max_runtime = max(runtimes) if runtimes else float('inf')
         with self._paint_lock:
             self._rows.append((category, sort_key, max_runtime, cells))
