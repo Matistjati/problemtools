@@ -2,73 +2,70 @@
 Implementation of programs provided by a directory with build/run scripts.
 """
 
-import logging
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 
 from . import rutil
 from .errors import ProgramError
-from .program import Program
-
-log = logging.getLogger(__file__)
+from .program import CompileResult, Program
 
 
 class BuildRun(Program):
     """Class for build/run-script program."""
 
-    def __init__(self, path: str, work_dir: str):
+    def __init__(self, path: str) -> None:
         """Instantiate BuildRun object.
 
         Args:
             path: directory containing the build script.
-            work_dir: name of temp directory in which to run the scripts.
         """
-        super().__init__()
-
         if not os.path.isdir(path):
-            raise ProgramError('%s is not a directory' % path)
+            raise ProgramError(f'{path} is not a directory')
 
         if path[-1] == '/':
             path = path[:-1]
-        self.name = os.path.basename(path)
-        self.path = os.path.join(work_dir, self.name)
-        if os.path.exists(self.path):
-            self.path = tempfile.mkdtemp(prefix='%s-' % self.name, dir=work_dir)
-        else:
-            os.makedirs(self.path)
+        name = os.path.basename(path)
+        super().__init__(name=name)
+        self._source_path = path
 
-        rutil.add_files(path, self.path)
+    def do_compile(self, work_dir: Path) -> CompileResult:
+        """Set up the compile work-space (copying the build script and friends into
+        work_dir) and run the build script."""
+        name = self.name
+        run_path = work_dir / name
+        if os.path.exists(run_path):
+            run_path = Path(tempfile.mkdtemp(prefix=f'{name}-', dir=work_dir))
+        else:
+            os.makedirs(run_path)
+        self._path = run_path
+
+        rutil.add_files(self._source_path, self.path)
 
         build = os.path.join(self.path, 'build')
         if not os.path.isfile(build):
-            raise ProgramError('%s does not have a build script' % path)
+            raise ProgramError(f'{self._source_path} does not have a build script')
         if not os.access(build, os.X_OK):
-            raise ProgramError('%s/build is not executable' % path)
+            raise ProgramError(f'{self._source_path}/build is not executable')
 
-    def __str__(self) -> str:
-        """String representation"""
-        return '%s/' % (self.path)
+        try:
+            subprocess.check_output(['./build'], stderr=subprocess.STDOUT, cwd=self.path)
+        except subprocess.CalledProcessError as err:
+            return CompileResult(False, err.output.decode('utf8', 'replace'), self.path)
 
-    def do_compile(self) -> tuple[bool, str | None]:
-        """Run the build script."""
-        with open(os.devnull, 'w') as devnull:
-            status = subprocess.call(['./build'], stdout=devnull, stderr=devnull, cwd=self.path)
         run = os.path.join(self.path, 'run')
+        if not os.path.isfile(run) or not os.access(run, os.X_OK):
+            return CompileResult(False, 'build script did not produce an executable called "run"', self.path)
+        return CompileResult(True, None, self.path)
 
-        if status:
-            logging.debug('Build script failed (status %d) when compiling %s\n', status, self.name)
-            return (False, 'build script failed with exit code %d' % (status))
-        elif not os.path.isfile(run) or not os.access(run, os.X_OK):
-            return (False, 'build script did not produce an executable called "run"')
-        else:
-            return (True, None)
-
-    def get_runcmd(self, cwd=None, memlim=None) -> list[str]:
+    def get_runcmd(self, cwd: str | None = None, memlim: int = 1024) -> list[str]:
         """Run command for the program.
 
+        Must not be called until compile() has been called.
+
         Args:
-            cwd (str): if not None, the run command is provided
+            cwd: if not None, the run command is provided
                 relative to cwd (otherwise absolute paths are given).
         """
         path = self.path if cwd is None else os.path.relpath(self.path, cwd)

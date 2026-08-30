@@ -36,9 +36,15 @@ etc. Example problem packages are in `examples/` and `tests/problems/`.
 
 ## Architecture
 
-- `problemtools/verifyproblem.py` — the heart of the tool. Defines `Problem`, `ProblemAspect`/
-  `ProblemPart`, `TestCaseGroup`, `TestCase`, `Submissions`, `OutputValidators`, and the `main()`
-  argparser. A problem is checked by running each `ProblemPart`'s `check(context)`.
+- `problemtools/verifyproblem.py` — the driver. `model.load_problem()` parses the package, then
+  `ProblemVerifier.check(context)` runs a list of `_CheckStep`s (one per `checks.check_*` function,
+  tagged with the `-p/--parts` group it belongs to) against it. Also holds the `main()` argparser.
+- `problemtools/model/` — the parsed package, as plain frozen dataclasses with no checking logic:
+  `Problem`, `TestCase`/`TestDataGroup`, `Submission`/`Submissions`, `InputValidators`/
+  `OutputValidators`, `Graders`, `Statements`, `Attachments`, `Includes`.
+- `problemtools/checks/` — one module per part, each a `check_<part>(model..., diag)` function that
+  reports through `Diagnostics` rather than owning any state.
+- `problemtools/results_table.py` — the fork's live `rich` results table (see below).
 - `problemtools/context.py` — `Context` carries per-run flags and the thread-pool executors through the
   check tree.
 - `problemtools/judge/` — the judging core:
@@ -64,8 +70,9 @@ New `verifyproblem` CLI flags (`argparser_basic_arguments` in `verifyproblem.py`
 
 The features:
 
-1. **Live rich results table** (`SubtaskResultsTable` in `verifyproblem.py`). Replaces the old
-   `_print_results_table` with a live-updating `rich` table: one row per submission, one column per
+1. **Live rich results table** (`SubtaskResultsTable` in `results_table.py`, driven from
+   `checks/submissions.py`). Replaces upstream's `_print_results_table` with a live-updating `rich`
+   table: one row per submission, one column per
    subtask group (sample + secret subgroups). Rows are grouped/sorted by verdict category
    (`AC, PAC, WA, RTE, TLE`). AC cells show runtime (or score with `--score`). It installs itself as a
    `rich.live.Live` and reroutes logging stream handlers so log output coexists with the live table.
@@ -79,7 +86,7 @@ The features:
    coordination via `claim`/`complete`/`get`, with `Future`s for in-flight runs) is from master; the
    persistent `ResultCache` is the fork addition.
 
-3. **Multithreaded input validation** (`TestCaseGroup.check` in `verifyproblem.py`,
+3. **Multithreaded input validation** (`_check_group` in `checks/testdata.py`,
    `validation_executor` in `context.py`). Test cases within a group are validated concurrently via a
    `ThreadPoolExecutor` (sized to `os.cpu_count()`), with cancellation on `VerifyError`. (Master's
    `-j`/`--threads` only parallelized submission running.)
@@ -100,6 +107,8 @@ The features:
 
 - Python 3.11+; `from __future__ import annotations` is used throughout. Type hints expected
   (`mypy.ini`, `py.typed`). `pre-commit` is configured (`.pre-commit-config.yaml`).
-- Match the surrounding style in `verifyproblem.py`: `ProblemAspect`/`ProblemPart` subclasses, `self.msg`/
-  `self.warning`/`self.error` for output, `Context`-threaded flags.
+- Keep the model/checks split: `model/` parses and holds data, `checks/` inspects it and reports via
+  `diag.msg`/`diag.warning`/`diag.error` (plain `print` for non-diagnostic progress output), with
+  per-run flags threaded through `Context`.
+- `ruff` (pinned in `.pre-commit-config.yaml`) and `mypy` (`disallow_untyped_defs`) both must pass.
 - `todo.md` tracks the fork's open items (e.g. show per-group worth in subtask tables).

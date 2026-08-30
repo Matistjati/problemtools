@@ -3,12 +3,15 @@ This module contains functionality for reading and using configuration
 of programming languages.
 """
 
+import dataclasses
 import fnmatch
 import re
+import shlex
+import shutil
 import string
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import Final, TypeVar
 
 from . import config
 
@@ -22,13 +25,24 @@ class LanguageConfigError(Exception):
     """Exception class for errors in language configuration."""
 
 
-class Language:
-    """
-    Class representing a single language.
-    """
+@dataclasses.dataclass
+class CommandSubstitution:
+    """Fields that may appear in a language's "compile" and "run" command templates"""
 
-    __KEYS = ['name', 'priority', 'files', 'shebang', 'shebang_files', 'compile', 'run']
-    __VARIABLES = ['path', 'files', 'binary', 'mainfile', 'mainclass', 'Mainclass', 'memlim']
+    path: str
+    files: str
+    binary: str
+    mainfile: str
+    mainclass: str
+    Mainclass: str
+    memlim: int = 1024
+
+
+class Language:
+    """Class representing a single language."""
+
+    __KEYS: Final[list[str]] = ['name', 'priority', 'files', 'shebang', 'shebang_files', 'compile', 'run']
+    __VARIABLES: Final[set[str]] = {field.name for field in dataclasses.fields(CommandSubstitution)}
     __MAINFILE_RE = re.compile(r'^main\.', re.IGNORECASE)
 
     name: str
@@ -48,7 +62,7 @@ class Language:
                 of the language.
         """
         if not re.match('[a-z][a-z0-9]*', lang_id):
-            raise LanguageConfigError('Invalid language ID "%s"' % lang_id)
+            raise LanguageConfigError(f'Invalid language ID "{lang_id}"')
         self.lang_id = lang_id
         self.update(lang_spec)
 
@@ -92,6 +106,58 @@ class Language:
         """
         return [f for f in files if Language.__MAINFILE_RE.match(Path(f).name)]
 
+    def check_installed(self) -> str | None:
+        """Check that the compiler and/or runtime seem available.
+
+        Returns:
+            None on success, or human-readable message describing what's missing
+        """
+        for role, template in (('compiler', self.compile), ('runtime', self.run)):
+            if template is None:
+                continue
+            executable = Language.__literal_executable(template)
+            if executable is not None and shutil.which(executable) is None:
+                return f'{self.name}: could not find {role} "{executable}" -- is it installed and on PATH?'
+        return None
+
+    def get_compile_command(self, subs: CommandSubstitution) -> list[str] | None:
+        """Command to compile a program, or None if there is no compile step."""
+        if self.compile is None:
+            return None
+        return self.__build_command(self.compile, subs)
+
+    def get_run_command(self, subs: CommandSubstitution) -> list[str]:
+        """Command to run a program in this language."""
+        return self.__build_command(self.run, subs)
+
+    def __build_command(self, template: str, subs: CommandSubstitution) -> list[str]:
+        """Substitute metavariables into a compile/run command template,
+        producing an argv list ready to execute.
+
+        If the template's command is a literal executable name/path rather
+        than one produced by compilation, it is resolved to an absolute path.
+
+        Args:
+            template: a "compile" or "run" command template, i.e.
+                self.compile or self.run.
+            subs: substitution values for the metavariables appearing
+                in template.
+        """
+        argv = shlex.split(template.format(**dataclasses.asdict(subs)))
+        executable = Language.__literal_executable(template)
+        if executable is not None:
+            argv[0] = shutil.which(executable) or executable
+        return argv
+
+    @staticmethod
+    def __literal_executable(template: str) -> str | None:
+        """The first token of a compile/run command template, if it's a
+        literal executable name/path -- as opposed to one produced by
+        compilation, such as {binary} or "{mainfile}.out". Returns None
+        for the latter case."""
+        first = shlex.split(template)[0]
+        return None if '{' in first else first
+
     # Update is no longer really needed - we only call it from the constructor.
     # But cleaning that up doesn't simplify the code much, so we keep it around
     # for now.
@@ -105,16 +171,16 @@ class Language:
 
         # Check that all provided values are known keys
         for unknown in set(values) - set(Language.__KEYS):
-            raise LanguageConfigError('Unknown key "%s" specified for language %s' % (unknown, self.lang_id))
+            raise LanguageConfigError(f'Unknown key "{unknown}" specified for language {self.lang_id}')
 
         for key, value in values.items():
             # Check type
             if key == 'priority':
                 if not isinstance(value, int):
-                    raise LanguageConfigError('Language %s: priority must be integer but is %s.' % (self.lang_id, type(value)))
+                    raise LanguageConfigError(f'Language {self.lang_id}: priority must be integer but is {type(value)}.')
             else:
                 if not isinstance(value, str):
-                    raise LanguageConfigError('Language %s: %s must be string but is %s.' % (self.lang_id, key, type(value)))
+                    raise LanguageConfigError(f'Language {self.lang_id}: {key} must be string but is {type(value)}.')
 
             # Save the value
             if key == 'shebang':
@@ -151,21 +217,21 @@ class Language:
         variables = Language.__variables_in_command(self.run)
         if self.compile is not None:
             variables = variables | Language.__variables_in_command(self.compile)
-        for unknown in variables - set(Language.__VARIABLES):
-            raise LanguageConfigError('Unknown variable "{%s}" used for language %s' % (unknown, self.lang_id))
+        for unknown in variables - Language.__VARIABLES:
+            raise LanguageConfigError(f'Unknown variable "{{{unknown}}}" used for language {self.lang_id}')
 
         # Check for uniquely defined entry point
-        entry = variables & set(['binary', 'mainfile', 'mainclass', 'Mainclass'])
+        entry = variables & {'binary', 'mainfile', 'mainclass', 'Mainclass'}
         if len(entry) == 0:
-            raise LanguageConfigError('No entry point variable used for language %s' % self.lang_id)
+            raise LanguageConfigError(f'No entry point variable used for language {self.lang_id}')
         if len(entry) > 1:
-            raise LanguageConfigError('More than one entry point type variable used for language %s' % self.lang_id)
+            raise LanguageConfigError(f'More than one entry point type variable used for language {self.lang_id}')
 
     @staticmethod
     def __variables_in_command(cmd: str) -> set[str]:
         """List all meta-variables appearing in a string."""
         formatter = string.Formatter()
-        return set(field for _, field, _, _ in formatter.parse(cmd) if field is not None)
+        return {field for _, field, _, _ in formatter.parse(cmd) if field is not None}
 
     def __passes_shebang_gate(self, filename: str | Path) -> bool:
         """Check if a file matched by shebang_files also matches shebang.
@@ -218,7 +284,7 @@ class Languages:
 
     def get(self, lang_id: str) -> Language | None:
         if not isinstance(lang_id, str):
-            raise LanguageConfigError('Config file error: language IDs must be strings, but %s is %s.' % (lang_id, type(lang_id)))
+            raise LanguageConfigError(f'Config file error: language IDs must be strings, but {lang_id} is {type(lang_id)}.')
         return self.languages.get(lang_id, None)
 
     def update(self, data: dict) -> None:
@@ -231,18 +297,15 @@ class Languages:
                 for that language will be overridden and updated.
         """
         if not isinstance(data, dict):
-            raise LanguageConfigError('Config file error: content must be a dictionary, but is %s.' % (type(data)))
+            raise LanguageConfigError(f'Config file error: content must be a dictionary, but is {type(data)}.')
 
         for lang_id, lang_spec in data.items():
             if not isinstance(lang_id, str):
-                raise LanguageConfigError(
-                    'Config file error: language IDs must be strings, but %s is %s.' % (lang_id, type(lang_id))
-                )
+                raise LanguageConfigError(f'Config file error: language IDs must be strings, but {lang_id} is {type(lang_id)}.')
 
             if not isinstance(lang_spec, (dict, Language)):
                 raise LanguageConfigError(
-                    'Config file error: language spec must be a dictionary, but spec of language %s is %s.'
-                    % (lang_id, type(lang_spec))
+                    f'Config file error: language spec must be a dictionary, but spec of language {lang_id} is {type(lang_spec)}.'
                 )
 
             if isinstance(lang_spec, Language):
@@ -256,7 +319,7 @@ class Languages:
         for lang_id, lang in self.languages.items():
             if lang.priority in priorities:
                 raise LanguageConfigError(
-                    'Languages %s and %s both have priority %d.' % (lang_id, priorities[lang.priority], lang.priority)
+                    f'Languages {lang_id} and {priorities[lang.priority]} both have priority {lang.priority}.'
                 )
             priorities[lang.priority] = lang_id
 

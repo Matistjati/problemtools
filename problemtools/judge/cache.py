@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import os
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING
 
+from ..metadata import Metadata
+from ..model import TestCase
+from ..run import Program
 from .result import SubmissionResult
-
-if TYPE_CHECKING:
-    from ..verifyproblem import TestCase
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,22 @@ class CacheKey:
     input_hash: bytes
     ans_hash: bytes
     validator_flags: tuple[str, ...]
+
+
+@cache
+def _compute_reuse_key(infile: Path, ansfile: Path, output_validator_flags: tuple[str, ...]) -> CacheKey:
+    return CacheKey(
+        input_hash=hashlib.sha256(infile.read_bytes()).digest(),
+        ans_hash=hashlib.sha256(ansfile.read_bytes()).digest(),
+        validator_flags=output_validator_flags,
+    )
+
+
+def compute_reuse_key(testcase: TestCase) -> CacheKey:
+    """A key identifying testcase for result-reuse purposes: same input/answer file contents
+    and same output validator flags means a result can be reused. Memoized, since this hashes
+    file contents on first computation for a given testcase."""
+    return _compute_reuse_key(testcase.infile, testcase.ansfile, tuple(testcase.output_validator_flags))
 
 
 @dataclass
@@ -74,7 +94,7 @@ class ResultStore:
         Returns True if the key was unclaimed; the caller must eventually call
         complete().  Returns False if the key is already in-flight or completed.
         """
-        key = testcase.reuse_key
+        key = compute_reuse_key(testcase)
         with self._lock:
             if key in self._store:
                 return False
@@ -83,7 +103,7 @@ class ResultStore:
 
     def complete(self, testcase: TestCase, result: SubmissionResult, run_timelim: float) -> None:
         """Store the completed result and wake any consumer waiting on the future."""
-        key = testcase.reuse_key
+        key = compute_reuse_key(testcase)
         with self._lock:
             future = self._store[key]
             self._store[key] = _CacheEntry(result=result, run_timelim=run_timelim)
@@ -99,7 +119,7 @@ class ResultStore:
             None              — not present, or was run at a lower limit than timelim and
                                 cannot be reused; caller must run the testcase synchronously.
         """
-        key = testcase.reuse_key
+        key = compute_reuse_key(testcase)
         with self._lock:
             val = self._store.get(key)
         if val is None:
@@ -113,20 +133,22 @@ class ResultStore:
             return None
         return _with_test_node(_reclassify(val.result, timelim), testcase)
 
-import hashlib
-import json
-import os
 
 class ResultCache:
-    """Cross-run cache for single-testcase execution results."""
+    """Cross-run cache for single-testcase execution results, stored as JSON under a
+    temp directory. Keyed on everything that can change a testcase's result: the
+    submission's language and sources, the input and answer files, the output validator's
+    sources and flags, and the memory limit. The time limit is deliberately *not* part of
+    the key -- it's stored alongside the result and used to decide whether an entry can
+    serve a given limit (see lookup())."""
 
     _CACHE_DIR = '/tmp/problemtools/cache'
 
     def __init__(self) -> None:
         os.makedirs(self._CACHE_DIR, exist_ok=True)
-        self._file_hashes: dict[str, str] = {}
+        self._file_hashes: dict[Path, str] = {}
 
-    def _hash_file_content(self, path: str) -> str:
+    def _hash_file_content(self, path: Path) -> str:
         digest = self._file_hashes.get(path)
         if digest is None:
             h = hashlib.sha256()
@@ -137,14 +159,23 @@ class ResultCache:
             self._file_hashes[path] = digest
         return digest
 
-    def _make_key(self, sub, testcase, problem) -> str:
+    def _hash_program(self, h: hashlib._Hash, program: Program) -> None:
+        """Mix a program's identity into h: its language plus the contents of its sources.
+
+        Programs that aren't source code (e.g. the bundled default validator) have neither
+        attribute; fall back to the name, which is stable for those."""
+        language = getattr(program, 'language', None)
+        h.update((language.lang_id if language is not None else program.name).encode())
+        for src_file in sorted(getattr(program, 'src', [])):
+            src_path = Path(src_file)
+            h.update(src_path.name.encode())
+            h.update(self._hash_file_content(src_path).encode())
+
+    def _make_key(self, sub: Program, testcase: TestCase, output_validator: Program, metadata: Metadata) -> str:
         h = hashlib.sha256()
 
         h.update(b'lang:')
-        h.update(sub.language.lang_id.encode())
-        for src_file in sorted(sub.src):
-            h.update(os.path.basename(src_file).encode())
-            h.update(self._hash_file_content(src_file).encode())
+        self._hash_program(h, sub)
 
         h.update(b'\x00in:')
         h.update(self._hash_file_content(testcase.infile).encode())
@@ -153,32 +184,26 @@ class ResultCache:
         h.update(self._hash_file_content(testcase.ansfile).encode())
 
         h.update(b'\x00val:')
-        if problem.output_validators.uses_default_validator():
-            h.update(b'default')
-        else:
-            for val in problem.output_validators._validators:
-                if hasattr(val, 'src'):
-                    for src_file in sorted(val.src):
-                        h.update(os.path.basename(src_file).encode())
-                        h.update(self._hash_file_content(src_file).encode())
+        self._hash_program(h, output_validator)
 
         h.update(b'\x00vflags:')
-        flags = (
-            problem.metadata.legacy_validator_flags
-            + '\x00'
-            + testcase.testcasegroup.config.get('output_validator_flags', '')
-        )
-        h.update(flags.encode())
+        # TestCase.output_validator_flags already has the problem-level legacy flags merged in.
+        h.update('\x00'.join(testcase.output_validator_flags).encode())
 
         h.update(b'\x00memlim:')
-        h.update(str(problem.metadata.limits.memory).encode())
+        h.update(str(metadata.limits.memory).encode())
 
         return h.hexdigest()
 
     def lookup(
-        self, sub, testcase, problem, timelim_high: float,
+        self,
+        sub: Program,
+        testcase: TestCase,
+        output_validator: Program,
+        metadata: Metadata,
+        timelim_high: float,
     ) -> SubmissionResult | None:
-        key = self._make_key(sub, testcase, problem)
+        key = self._make_key(sub, testcase, output_validator, metadata)
         path = os.path.join(self._CACHE_DIR, f'{key}.json')
         try:
             with open(path) as f:
@@ -191,9 +216,11 @@ class ResultCache:
         cached_timelim: float = data['timelim_high']
 
         if cached_verdict == 'TLE':
+            # A TLE only carries over to a limit no higher than the one it was measured at.
             if cached_timelim < timelim_high:
                 return None
         else:
+            # Anything else carries over as long as it fits inside the limit we're asked about.
             if cached_runtime > timelim_high:
                 return None
 
@@ -217,10 +244,15 @@ class ResultCache:
         return res
 
     def store(
-        self, sub, testcase, problem,
-        timelim_high: float, res_high: SubmissionResult,
+        self,
+        sub: Program,
+        testcase: TestCase,
+        output_validator: Program,
+        metadata: Metadata,
+        timelim_high: float,
+        res_high: SubmissionResult,
     ) -> None:
-        key = self._make_key(sub, testcase, problem)
+        key = self._make_key(sub, testcase, output_validator, metadata)
         data = {
             'verdict': res_high.verdict,
             'runtime': res_high.runtime,

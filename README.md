@@ -199,8 +199,8 @@ problemtools' configuration:
 
 1. `languages.yaml`.  Use it to override problemtools' default
    programming language configuration.  For instance, while the
-   problemtools default is to use the PyPy `/usr/bin/pypy3`
-   interpreter for Python 3. If you prefer  CPython, you can
+   problemtools default is to use the PyPy `pypy3` interpreter
+   for Python 3. If you prefer  CPython, you can
    use the following `languages.yaml`:
 
    ```yaml
@@ -245,7 +245,7 @@ for any languages used in problem packages.
 
 The dependencies needed to *build/install* problemtools can be installed with:
 
-    sudo apt install python3-venv automake g++ make libboost-regex-dev libgmp-dev python3 git
+    sudo apt install python3-venv automake g++ make python3 git
 
 And the dependencies needed to *run* problemtools can be installed with:
 
@@ -259,14 +259,20 @@ To render problem statements to pdf with non-latin characters, also add the foll
 
 On Fedora, these dependencies can be installed with:
 
-    sudo dnf install boost-regex gcc gmp-devel gmp-c++ pandoc python3 python3-pyyaml texlive-latex texlive-collection-fontsrecommended texlive-fancyhdr texlive-subfigure texlive-wrapfig texlive-import texlive-ulem texlive-xifthen texlive-overpic texlive-pbox tidy ghostscript
+    sudo dnf install gcc pandoc python3 python3-pyyaml texlive-latex texlive-collection-fontsrecommended texlive-fancyhdr texlive-subfigure texlive-wrapfig texlive-import texlive-ulem texlive-xifthen texlive-overpic texlive-pbox tidy ghostscript
 
 Followed by:
 
     pip3 install --user plastex nh3
 
-### Arch
-Package is available on the AUR [kattis-problemtools-git](https://aur.archlinux.org/packages/kattis-problemtools-git). Use your favorite AUR helper or follow the installation instructions found [here](https://wiki.archlinux.org/title/Arch_User_Repository#Installing_and_upgrading_packages).
+### Arch Linux
+
+Package is available on the AUR
+[kattis-problemtools](https://aur.archlinux.org/packages/kattis-problemtools) or
+[kattis-problemtools-git](https://aur.archlinux.org/packages/kattis-problemtools-git).
+Use your favorite AUR helper or
+follow the installation instructions found
+[here](https://wiki.archlinux.org/title/Arch_User_Repository#Installing_and_upgrading_packages).
 
 ### Other platforms
 

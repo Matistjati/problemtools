@@ -5,19 +5,16 @@ import sys
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING
 
 from ..context import Context
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
-from ..run import Program, get_tool
-from .cache import ResultStore, ResultCache
+from ..model import DEFAULT_GRADER, Graders, TestCase, TestDataGroup
+from ..run import Program
+from .cache import ResultCache, ResultStore
 from .execute import execute_testcase
 from .grade import grade_group
 from .result import SubmissionResult
-
-if TYPE_CHECKING:
-    from ..verifyproblem import TestCase, TestCaseGroup
 
 
 class _Cancelled:
@@ -29,11 +26,11 @@ class _Cancelled:
 
     def __contains__(self, testcase: TestCase) -> bool:
         with self._lock:
-            return testcase.infile_path in self._ids
+            return testcase.infile in self._ids
 
     def add(self, testcase: TestCase) -> None:
         with self._lock:
-            self._ids.add(testcase.infile_path)
+            self._ids.add(testcase.infile)
 
 
 class SubmissionJudge:
@@ -56,18 +53,16 @@ class SubmissionJudge:
     jobs complete normally; their results are simply not consumed by judge().
     """
 
-    _default_grader: Program | None = get_tool('default_grader')
-
     def __init__(
         self,
         sub: Program,
         output_validator: Program,
         metadata: Metadata,
-        root: TestCaseGroup,
+        root: TestDataGroup,
         base_dir: Path,
         context: Context,
+        graders: Graders,
         diag: Diagnostics,
-        custom_grader: Program | None = None,
     ) -> None:
         self._sub = sub
         self._output_validator = output_validator
@@ -75,9 +70,11 @@ class SubmissionJudge:
         self._base_dir = base_dir
         self._context = context
         self._diag = diag
-        self._custom_grader = custom_grader
+        self._graders = graders
         self._store = ResultStore()
-        self._result_cache = ResultCache() if context.use_cache else None
+        # Cross-run cache. Interactive problems aren't cacheable: their result depends on the
+        # interactor's behaviour, which we don't hash.
+        self._result_cache = ResultCache() if context.use_cache and not metadata.is_interactive() else None
         self._root = root
         self._cancelled = _Cancelled()
         self._precompute_started = False
@@ -98,7 +95,7 @@ class SubmissionJudge:
     def judge(self, timelim: float) -> list[SubmissionResult]:
         """Walk the test tree in DFS order and return results as a flat list.
 
-        Each SubmissionResult has test_node set to the TestCase or TestCaseGroup it
+        Each SubmissionResult has test_node set to the TestCase or TestDataGroup it
         covers.  Group results immediately follow all their descendants; the root
         group's result is the last element.  Returns an empty list if all testcases
         were filtered out.
@@ -127,10 +124,9 @@ class SubmissionJudge:
             return
         if not self._store.claim(testcase):
             return  # duplicate testcase (same reuse_key) or already in store
-            
-        cacheable = self._result_cache is not None and not testcase._problem.is_interactive()
-        if cacheable:
-            cached = self._result_cache.lookup(self._sub, testcase, testcase._problem, timelim)
+
+        if self._result_cache is not None:
+            cached = self._result_cache.lookup(self._sub, testcase, self._output_validator, self._metadata, timelim)
             if cached is not None:
                 self._store.complete(testcase, cached, timelim)
                 return
@@ -139,10 +135,10 @@ class SubmissionJudge:
             result = self._run(testcase, timelim)
         except Exception as e:
             result = SubmissionResult('JE', reason=f'Internal error: {e}')
-            
-        if cacheable and result.verdict != 'JE':
-            self._result_cache.store(self._sub, testcase, testcase._problem, timelim, result)
-            
+
+        if self._result_cache is not None and result.verdict != 'JE':
+            self._result_cache.store(self._sub, testcase, self._output_validator, self._metadata, timelim, result)
+
         self._store.complete(testcase, result, timelim)
 
     def _judge_testcase(self, testcase: TestCase, timelim: float) -> SubmissionResult:
@@ -160,28 +156,30 @@ class SubmissionJudge:
             self._store.complete(testcase, result, timelim)
         return result
 
-    def _cancel_subtree(self, group: TestCaseGroup) -> None:
+    def _cancel_subtree(self, group: TestDataGroup) -> None:
         for testcase in group.get_all_testcases():
             self._cancelled.add(testcase)
 
-    def _grader_for(self, group: TestCaseGroup) -> Program | None:
+    def _grader_for(self, group: TestDataGroup) -> Program | None:
         if group.config.get('grading') == 'custom':
-            return self._custom_grader
-        return self._default_grader
+            return self._graders.grader
+        return DEFAULT_GRADER
 
-    def _judge_group(self, group: TestCaseGroup, timelim: float) -> list[SubmissionResult]:
+    def _judge_group(self, group: TestDataGroup, timelim: float) -> list[SubmissionResult]:
         all_results: list[SubmissionResult] = []  # Results of all children, groups and test cases, in DFS order. Our return value
         child_results: list[SubmissionResult] = []  # Results of our direct children, what we'll pass to the grader
 
-        filtered_items = (item for item in group._items if item.matches_filter(self._context.data_filter))
+        filtered_items = (item for item in group.items if item.matches_filter(self._context.data_filter))
         for item in filtered_items:
-            if item.is_group:
+            if isinstance(item, TestDataGroup):
                 sub = self._judge_group(item, timelim)
                 if not sub:  # If everything in a group is filtered, it returns an empty list.
                     continue
                 all_results.extend(sub)
                 result = sub[-1]  # last element is the subgroup's own result
             else:
+                # When a live results table is up it owns the terminal, so route progress through
+                # its status callback instead of writing (and erasing) directly on stdout.
                 status_callback = self._context.status_callback
                 msg = ''
                 if status_callback is not None:
@@ -191,7 +189,7 @@ class SubmissionJudge:
                     sys.stdout.write(msg)
                     sys.stdout.flush()
                 result = self._judge_testcase(item, timelim)
-                if status_callback is None and msg:
+                if msg:
                     sys.stdout.write('\b \b' * len(msg))
 
                 # Apply default score here - after we've entered it into the cache, as it may also be present in other groups with different defaults
@@ -215,7 +213,7 @@ class SubmissionJudge:
         all_results.append(group_verdict)
         return all_results
 
-    def _aggregate_group_result(self, child_results: list[SubmissionResult], group: TestCaseGroup) -> SubmissionResult:
+    def _aggregate_group_result(self, child_results: list[SubmissionResult], group: TestDataGroup) -> SubmissionResult:
         judge_error = next((r for r in child_results if r.verdict == 'JE'), None)
         if judge_error:
             result = copy.copy(judge_error)
@@ -231,6 +229,8 @@ class SubmissionJudge:
                 slowest = max(child_results, key=lambda r: r.runtime)
                 result.runtime = slowest.runtime
                 result.runtime_testcase = slowest.runtime_testcase
+                # Float-precision metrics aggregate as a max over the group's children, each
+                # carrying along the testcase that attained it.
                 for field in ('max_abs_err', 'max_rel_err', 'max_best_err'):
                     best_child = None
                     best_val: float | None = None
@@ -251,6 +251,5 @@ class SubmissionJudge:
                 if matching:
                     result.reason = matching.reason
                     result.additional_info = matching.additional_info
-
         result.test_node = group
         return result

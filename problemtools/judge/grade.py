@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import cast
 
 from ..diagnostics import Diagnostics
+from ..model import Verdict
 from ..run import Program
-from .result import SubmissionResult, Verdict
+from .result import SubmissionResult
 
 _GRADER_OUTPUT_RE = re.compile(r'^((AC)|(WA)|(TLE)|(RTE)|(MLE)|(OLE)|(JE))\s+-?[0-9.]+\s*$')
 
@@ -28,7 +29,7 @@ def grade_group(
     if not sub_results:
         return ('AC', 0.0)
 
-    if not grader.compile()[0]:
+    if not grader.compile(base_dir).success:
         diag.error(f'Failed to compile grader {grader}')
         return ('JE', None)
 

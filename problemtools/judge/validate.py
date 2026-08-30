@@ -3,16 +3,12 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
+from ..model import DEFAULT_VALIDATOR, TestCase
 from ..run import Program
 from .result import SubmissionResult
-
-if TYPE_CHECKING:
-    from ..verifyproblem import TestCase
-
 
 _PRECISION_MAX_TOKENS = 1_000_000
 
@@ -52,7 +48,9 @@ def _read_tokens(path: Path) -> list[str]:
 
 
 def _compute_precision(
-    team_path: Path, judge_path: Path, both_tols_set: bool,
+    team_path: Path,
+    judge_path: Path,
+    both_tols_set: bool,
 ) -> tuple[float, float, float] | None:
     """Compute (max_abs_err, max_rel_err, max_best_err) over float-token pairs.
 
@@ -87,14 +85,11 @@ def _compute_precision(
             rel_err = 0.0 if abs_err == 0 else float('inf')
         else:
             rel_err = abs_err / abs(jval)
-        if abs_err > max_abs:
-            max_abs = abs_err
-        if rel_err > max_rel:
-            max_rel = rel_err
+        max_abs = max(max_abs, abs_err)
+        max_rel = max(max_rel, rel_err)
         if both_tols_set:
-            best = abs_err if abs_err < rel_err else rel_err
-            if best > max_best:
-                max_best = best
+            best = min(rel_err, abs_err)
+            max_best = max(max_best, best)
     if not saw_float_pair:
         return None
     return max_abs, max_rel, max_best
@@ -167,11 +162,12 @@ def _validate_output(
     output_validator: Program,
     metadata: Metadata,
     execution_dir: Path,
+    base_dir: Path,
     diag: Diagnostics,
     infile: Path | None = None,
 ) -> SubmissionResult:
     feedback_dir = execution_dir / 'feedback'
-    effective_infile = infile if infile is not None else testcase.infile_path
+    effective_infile = infile if infile is not None else testcase.infile
     flags = testcase.output_validator_flags
     val_timelim = metadata.limits.validation_time
     val_memlim = metadata.limits.validation_memory
@@ -182,13 +178,13 @@ def _validate_output(
             'OLE', reason=f'output ({output_size:.1f} MiB) exceeds output limit ({metadata.limits.output} MiB)'
         )
 
-    if not output_validator.compile()[0]:
+    if not output_validator.compile(base_dir).success:
         return SubmissionResult('JE', reason=f'output validator {output_validator} failed to compile')
     val_stdout = execution_dir / 'val_stdout'
     val_stderr = execution_dir / 'val_stderr'
     status, _ = output_validator.run(
         infile=str(submission_output),
-        args=[str(effective_infile), str(testcase.ansfile_path), str(feedback_dir) + os.sep] + flags,
+        args=[str(effective_infile), str(testcase.ansfile), str(feedback_dir) + os.sep] + flags,
         timelim=val_timelim,
         memlim=val_memlim,
         outfile=str(val_stdout),
@@ -201,11 +197,11 @@ def _validate_output(
         except OSError as e:
             diag.info(f'Failed to read validator output: {e}')
     result = _parse_validator_result(output_validator, status, feedback_dir, metadata)
-    if result.verdict in ('AC', 'WA') and testcase._problem.output_validators.uses_default_validator():
+    if result.verdict in ('AC', 'WA') and output_validator is DEFAULT_VALIDATOR:
         abs_tol, rel_tol = parse_float_tolerances(flags)
         if abs_tol is not None or rel_tol is not None:
             both_set = abs_tol is not None and rel_tol is not None
-            triplet = _compute_precision(submission_output, testcase.ansfile_path, both_set)
+            triplet = _compute_precision(submission_output, testcase.ansfile, both_set)
             if triplet is not None:
                 result.max_abs_err = triplet[0]
                 result.max_abs_err_tc = testcase
@@ -228,4 +224,4 @@ def validate_output(
     with tempfile.TemporaryDirectory(dir=base_dir) as exec_dir:
         execution_dir = Path(exec_dir)
         (execution_dir / 'feedback').mkdir()
-        return _validate_output(testcase, submission_output, output_validator, metadata, execution_dir, diag)
+        return _validate_output(testcase, submission_output, output_validator, metadata, execution_dir, base_dir, diag)

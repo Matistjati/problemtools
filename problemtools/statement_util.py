@@ -6,7 +6,9 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from . import metadata
@@ -29,7 +31,7 @@ def find_statements(problem_root: Path, version: FormatVersion) -> dict[str, lis
     directory = problem_root / version.statement_directory
     ret = collections.defaultdict(list)
     if directory.is_dir():
-        filename_re = re.compile(r'^problem(\.([a-z]{2,3}|[a-z]{2}-[A-Z]{2}))?\.(%s)$' % ('|'.join(version.statement_extensions)))
+        filename_re = re.compile(r'^problem(\.([a-z]{2,3}|[a-z]{2}-[A-Z]{2}))?\.(%s)$' % ('|'.join(version.statement_extensions)))  # noqa: UP031
         for file in directory.iterdir():
             if m := filename_re.search(file.name):
                 if m.group(2) is None:  # problem.tex is allowed and assumed to be 'en' in legacy. We ignore it in newer formats.
@@ -74,7 +76,7 @@ def find_statement(problem_root: Path, language: str) -> Path:
 def get_yaml_problem_name(problem_root: Path, language: str) -> str:
     """Finds the problem name from the problem.yaml file"""
 
-    problem_metadata, _ = metadata.load_metadata(problem_root)
+    problem_metadata = metadata.load_metadata(problem_root)
     names = problem_metadata.name
     # If there is only one language, per the spec that is the one we want
     if len(names) == 1:
@@ -85,7 +87,7 @@ def get_yaml_problem_name(problem_root: Path, language: str) -> str:
     return names[language]
 
 
-def json_dfs(data, callback) -> None:
+def json_dfs(data: Any, callback: Callable[[str], None]) -> None:
     """Traverse all items in a JSON tree, find all images, and call callback for each one"""
     if isinstance(data, dict):
         for key, value in data.items():
@@ -100,7 +102,7 @@ def json_dfs(data, callback) -> None:
             json_dfs(item, callback)
 
 
-def foreach_image(statement_path: Path, callback):
+def foreach_image(statement_path: Path, callback: Callable[[str], None]) -> None:
     """Find all images in the statement and call callback for each one"""
     command = ['pandoc', str(statement_path), '-t', 'json']
     # Must create a working directory for pytest to work
@@ -187,7 +189,7 @@ def format_samples(problem_root: Path) -> list[str]:
         return []
     samples = []
     casenum = 1
-    problem_metadata, _ = metadata.load_metadata(problem_root)
+    problem_metadata = metadata.load_metadata(problem_root)
     is_multi_pass = problem_metadata.is_multi_pass()
     is_interactive = problem_metadata.is_interactive()
     all_cases = os.listdir(sample_path)
@@ -233,19 +235,19 @@ def format_normal_sample(sample_root: str, sample: str, casenum: int) -> str:
     with open(outpath, 'r', encoding='utf-8') as outfile:
         sample_output = outfile.read()
 
-    return """
+    return f"""
         <table class="sample" summary="sample data">
         <tbody>
             <tr>
-                <th>Sample Input %(case)d</th>
-                <th>Sample Output %(case)d</th>
+                <th>Sample Input {casenum}</th>
+                <th>Sample Output {casenum}</th>
             </tr>
             <tr>
-                <td><pre>%(input)s</pre></td>
-                <td><pre>%(output)s</pre></td>
+                <td><pre>{html.escape(sample_input)}</pre></td>
+                <td><pre>{html.escape(sample_output)}</pre></td>
             </tr>
         </tbody>
-        </table>""" % ({'case': casenum, 'input': html.escape(sample_input), 'output': html.escape(sample_output)})
+        </table>"""
 
 
 def format_interactive_sample(sample_root: str, sample: str, casenum: int, is_interactive: bool, is_multi_pass: bool) -> str:

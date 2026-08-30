@@ -4,15 +4,18 @@ Implementation of programs provided by source code.
 
 import logging
 import os
-import shlex
 import subprocess
 import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..languages import Language
-from ..model import LanguageIncludes
+from ..languages import CommandSubstitution, Language
 from . import rutil
 from .errors import ProgramError
-from .program import Program
+from .program import CompileResult, Program
+
+if TYPE_CHECKING:
+    from ..model import LanguageIncludes
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +23,7 @@ log = logging.getLogger(__name__)
 class SourceCode(Program):
     """Class representing a program provided by source code."""
 
-    def __init__(self, path: str, language: Language, work_dir: str, includes: LanguageIncludes):
+    def __init__(self, path: str, language: Language, includes: 'LanguageIncludes') -> None:
         """Instantiate SourceCode object
 
         Args:
@@ -32,32 +35,43 @@ class SourceCode(Program):
             language: language definition for the programming
                 language of the code.
 
-            work_dir: temp directory in which to compile programs etc
-
             includes: include files to add alongside the source
                 file(s), already resolved for this program's language
                 (see Includes.get_includes_for_language). If it specifies
                 a mainfile, that takes precedence over the one we would
                 otherwise have detected.
         """
-        super().__init__()
-
         if path[-1] == '/':
             path = path[:-1]
-        self.name = os.path.basename(path)
+        name = os.path.basename(path)
+        super().__init__(name=name)
         self.language = language
+        self._source_path = path
+        self._includes = includes
+        if os.path.isfile(path):
+            self._code_size = os.path.getsize(path)
+        else:
+            self._code_size = sum(os.path.getsize(f) for f in rutil.list_files_recursive(path))
+
+    def code_size(self) -> int:
+        return self._code_size
+
+    def do_compile(self, work_dir: Path) -> CompileResult:
+        """Set up the compile work-space (copying source and includes into work_dir) and
+        compile the source code."""
+        name = self.name
 
         # Set up work-space
-        self.path = os.path.join(work_dir, self.name)
-        if os.path.exists(self.path):
-            self.path = tempfile.mkdtemp(prefix='%s-' % self.name, dir=work_dir)
+        run_path = work_dir / name
+        if os.path.exists(run_path):
+            run_path = Path(tempfile.mkdtemp(prefix=f'{name}-', dir=work_dir))
         else:
-            os.makedirs(self.path)
+            os.makedirs(run_path)
+        self._path = run_path
 
         # Copy all files
-        rutil.add_files(path, self.path)
-        self._code_size = sum(os.path.getsize(f) for f in rutil.list_files_recursive(self.path))
-        for include_file in includes.files:
+        rutil.add_files(self._source_path, self.path)
+        for include_file in self._includes.files:
             dest = os.path.join(self.path, include_file.path)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, 'wb') as f:
@@ -65,10 +79,10 @@ class SourceCode(Program):
 
         self.src = sorted(self.language.get_source_files(rutil.list_files_recursive(self.path)))
         if len(self.src) == 0:
-            raise ProgramError('No source files found for language %s in %s' % (self.language.lang_id, self.name))
+            raise ProgramError(f'No source files found for language {self.language.lang_id} in {self.name}')
 
-        if includes.mainfile is not None:
-            self.mainfile = os.path.join(self.path, includes.mainfile)
+        if self._includes.mainfile is not None:
+            self.mainfile = os.path.join(self.path, self._includes.mainfile)
         else:
             candidates = self.language.mainfile_candidates(self.src)
             self.mainfile = str(candidates[0]) if candidates else self.src[0]
@@ -78,54 +92,39 @@ class SourceCode(Program):
 
         self.binary = os.path.join(self.path, 'run')
 
-    def code_size(self) -> int:
-        return self._code_size
+        not_installed = self.language.check_installed()
+        if not_installed is not None:
+            return CompileResult(False, not_installed, self.path)
 
-    def do_compile(self) -> tuple[bool, str | None]:
-        """Compile the source code.
-
-        Returns tuple:
-            (True, None) if compilation succeeded
-            (False, errmsg) otherwise
-        """
-        if self.language.compile is None:
-            return (True, None)
-
-        command = self.get_compilecmd()
-        compiler = command[0]
-
-        if not os.path.isfile(compiler) or not os.access(compiler, os.X_OK):
-            return (False, '%s does not seem to be installed, expected to find compiler at %s' % (self.language.name, compiler))
+        command = self.language.get_compile_command(self.__get_substitution())
+        if command is None:
+            return CompileResult(True, None, self.path)
 
         log.debug('compile command: %s', command)
 
         try:
             subprocess.check_output(command, stderr=subprocess.STDOUT)
-            return (True, None)
+            return CompileResult(True, None, self.path)
         except subprocess.CalledProcessError as err:
-            return (False, err.output.decode('utf8', 'replace'))
+            return CompileResult(False, err.output.decode('utf8', 'replace'), self.path)
 
-    def get_compilecmd(self) -> list[str]:
-        assert self.language.compile is not None, 'get_compilecmd called for a language with no compile command'
-        return shlex.split(self.language.compile.format(**self.__get_substitution()))
-
-    def get_runcmd(self, cwd=None, memlim=1024):
+    def get_runcmd(self, cwd: str | None = None, memlim: int = 1024) -> list[str]:
         """Run command for the program.
 
+        Must not be called until compile() has been called.
+
         Args:
-            cwd (str): if not None, the run command is provided
+            cwd: if not None, the run command is provided
                 relative to cwd (otherwise absolute paths are given).
-            memlim (int): if not None, memory limit in MiB (only
-                relevant for languages where memory limit is passed on
-                command line)
+            memlim: memory limit in MiB (only relevant for
+                languages where memory limit is passed on command line)
         """
-        self.compile()
         subs = self.__get_substitution(memlim)
         if cwd is not None:
-            subs['path'] = os.path.relpath(subs['path'], cwd)
-            subs['binary'] = os.path.relpath(subs['binary'], cwd)
-            subs['mainfile'] = os.path.relpath(subs['mainfile'], cwd)
-        return shlex.split(self.language.run.format(**subs))
+            subs.path = os.path.relpath(subs.path, cwd)
+            subs.binary = os.path.relpath(subs.binary, cwd)
+            subs.mainfile = os.path.relpath(subs.mainfile, cwd)
+        return self.language.get_run_command(subs)
 
     def should_skip_memory_rlimit(self) -> bool:
         """Ugly hack (see program.py for details)."""
@@ -133,15 +132,15 @@ class SourceCode(Program):
 
     def __str__(self) -> str:
         """String representation"""
-        return '%s (%s)' % (self.name, self.language.name)
+        return f'{self.name} ({self.language.name})'
 
-    def __get_substitution(self, memlim=1024):
-        return {
-            'path': self.path,
-            'files': ' '.join(self.src),
-            'memlim': memlim,
-            'mainfile': self.mainfile,
-            'mainclass': self.mainclass,
-            'Mainclass': self.Mainclass,
-            'binary': self.binary,
-        }
+    def __get_substitution(self, memlim: int = 1024) -> CommandSubstitution:
+        return CommandSubstitution(
+            path=str(self.path),
+            files=' '.join(self.src),
+            memlim=memlim,
+            mainfile=self.mainfile,
+            mainclass=self.mainclass,
+            Mainclass=self.Mainclass,
+            binary=self.binary,
+        )

@@ -23,14 +23,11 @@ import re
 import signal
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
+from ..model import TestCase
 from ..run import Program, get_tool
-
-if TYPE_CHECKING:
-    from ..verifyproblem import TestCase
 from .result import SubmissionResult
 from .validate import _parse_validator_result, _validate_output
 
@@ -72,25 +69,27 @@ def _run_normal(
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
+    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (non-interactive)"""
     outfile = execution_dir / 'submission_stdout'
     errfile = execution_dir / 'submission_stderr'
+    sub_path = sub.compile(base_dir).path
     status, runtime = sub.run(
         infile=str(infile),
         outfile=str(outfile),
         errfile=str(errfile),
         timelim=math.ceil(timelim) + 1,
         memlim=metadata.limits.memory,
-        work_dir=sub.path,
+        work_dir=sub_path,
     )
     if _is_TLE(status) or runtime > timelim:
         result = SubmissionResult('TLE')
     elif _is_RTE(status):
         result = SubmissionResult('RTE', reason=_rte_reason(status), additional_info=_read_safe(errfile))
     else:
-        result = _validate_output(testcase, outfile, output_validator, metadata, execution_dir, diag, infile=infile)
+        result = _validate_output(testcase, outfile, output_validator, metadata, execution_dir, base_dir, diag, infile=infile)
     result.runtime = runtime
     return result
 
@@ -103,6 +102,7 @@ def _run_interactive(
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
+    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (interactive)"""
@@ -111,8 +111,10 @@ def _run_interactive(
         diag.error('Could not locate interactive runner')
         return SubmissionResult('JE', reason='Could not locate interactive runner')
 
-    if not output_validator.compile()[0]:
+    if not output_validator.compile(base_dir).success:
         return SubmissionResult('JE', reason=f'output validator {output_validator} failed to compile')
+
+    sub_path = sub.compile(base_dir).path
 
     feedback_dir = execution_dir / 'feedback'
     interactive_out = execution_dir / 'interactive_output'
@@ -122,12 +124,12 @@ def _run_interactive(
         args=(
             ['1', str(math.ceil(2 * timelim))]
             + output_validator.get_runcmd(memlim=metadata.limits.validation_memory)
-            + [str(infile), str(testcase.ansfile_path), str(feedback_dir) + os.sep]
+            + [str(infile), str(testcase.ansfile), str(feedback_dir) + os.sep]
             + testcase.output_validator_flags
             + [';']
             + sub.get_runcmd(memlim=metadata.limits.memory)
         ),
-        work_dir=sub.path,
+        work_dir=sub_path,
     )
 
     if _is_RTE(i_status):
@@ -175,12 +177,13 @@ def _run_pass(
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
+    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (the common case, or one pass for a multi-pass problem)"""
     if metadata.is_interactive():
-        return _run_interactive(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
-    return _run_normal(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
+        return _run_interactive(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
+    return _run_normal(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
 
 
 def _run_multipass(
@@ -190,13 +193,14 @@ def _run_multipass(
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
+    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
-    infile = testcase.infile_path
+    infile = testcase.infile
     slowest = 0.0
     feedback_dir = execution_dir / 'feedback'
     for _ in range(metadata.limits.validation_passes):
-        result = _run_pass(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
+        result = _run_pass(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
         slowest = max(slowest, result.runtime)
         result.runtime = slowest
         nextpass = feedback_dir / 'nextpass.in'
@@ -225,9 +229,9 @@ def execute_testcase(
         execution_dir = Path(exec_dir)
         (execution_dir / 'feedback').mkdir()
         if metadata.is_multi_pass():
-            result = _run_multipass(testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
+            result = _run_multipass(testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
         else:
-            result = _run_pass(testcase.infile_path, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
+            result = _run_pass(testcase.infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
     result.test_node = testcase
     result.runtime_testcase = testcase
     return result

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import threading
 import sys
+import threading
 from abc import ABC, abstractmethod
 from typing import NoReturn
 
@@ -50,10 +50,11 @@ class Diagnostics(ABC):
 
 @dataclasses.dataclass
 class _Counts:
-    def __init__(self):
-        self.errors: int = 0
-        self.warnings: int = 0
-        self.lock = threading.Lock()
+    errors: int = 0
+    warnings: int = 0
+    #: Guards errors/warnings: they're bumped from the worker threads that run testcase
+    #: validation and submissions concurrently.
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
 
 class LoggingDiagnostics(Diagnostics):
