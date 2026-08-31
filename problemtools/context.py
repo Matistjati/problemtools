@@ -5,7 +5,7 @@ import re
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from re import Pattern
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 _T = TypeVar('_T')
 _P = ParamSpec('_P')
@@ -25,7 +25,6 @@ class Context:
         threads: int = 1,
         show_subtask_scores: bool = False,
         use_cache: bool = False,
-        validation_executor: ThreadPoolExecutor | None = None,
         status_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.data_filter = data_filter
@@ -35,16 +34,17 @@ class Context:
         self.show_subtask_scores = show_subtask_scores
         self.use_cache = use_cache
         self.executor: ThreadPoolExecutor | None = ThreadPoolExecutor(threads) if threads > 1 else None
-        self.validation_executor = validation_executor
         # Reports transient per-testcase progress ("Running ... on ...").  When a live
         # results table is active, it routes status through the table's caption instead
         # of writing directly to stdout (which the table's stdout redirect would mangle).
         self.status_callback = status_callback
-        self._background_work: list[concurrent.futures.Future[object]] = []
+        self._background_work: list[concurrent.futures.Future[Any]] = []
 
-    def submit_background_work(self, job: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> None:
+    def submit_background_work(self, job: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> concurrent.futures.Future[_T]:
         assert self.executor
-        self._background_work.append(self.executor.submit(job, *args, **kwargs))
+        future = self.executor.submit(job, *args, **kwargs)
+        self._background_work.append(future)
+        return future
 
     def cancel_background_work(self) -> None:
         for future in self._background_work:

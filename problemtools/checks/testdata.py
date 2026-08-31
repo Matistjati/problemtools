@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections
-import concurrent.futures
 import glob
 import hashlib
 import os
@@ -25,7 +24,7 @@ from ..model import (
     TestDataGroup,
 )
 from ..run import Program
-from .validators import check_testcase_input
+from .validators import InputValidationCache
 
 
 def check_testdata(
@@ -48,6 +47,9 @@ def check_testdata(
     has_custom_grader = graders.grader is not None
     has_default_grader = DEFAULT_GRADER is not None
 
+    input_validation = InputValidationCache(input_validators, work_dir)
+    input_validation.precompute(testdata, context)
+
     _check_group(
         testdata,
         context,
@@ -55,7 +57,7 @@ def check_testdata(
         probdir,
         has_custom_grader,
         has_default_grader,
-        input_validators,
+        input_validation,
         output_validator,
         work_dir,
         diag,
@@ -69,7 +71,7 @@ def _check_group(
     probdir: Path,
     has_custom_grader: bool,
     has_default_grader: bool,
-    input_validators: InputValidators,
+    input_validation: InputValidationCache,
     output_validator: Program,
     work_dir: Path,
     diag: Diagnostics,
@@ -180,44 +182,24 @@ def _check_group(
             diag.warning(f"Test data group '{last_testgroup_name}' will be ordered before '{name}'; consider zero-padding")
         last_testgroup_name = name
 
-    children = [child for child in group.items if child.matches_filter(context.data_filter)]
-    testcases = [child for child in children if isinstance(child, TestCase)]
-    subgroups = [child for child in children if isinstance(child, TestDataGroup)]
-
-    # Testcase checks are independent of each other and dominated by running the input
-    # validator, so run them concurrently when an executor is available.
-    if context.validation_executor is not None and len(testcases) > 1:
-        futures = [
-            context.validation_executor.submit(
-                _check_testcase, testcase, metadata, input_validators, output_validator, work_dir, diag
+    for child in group.items:
+        if not child.matches_filter(context.data_filter):
+            continue
+        if isinstance(child, TestDataGroup):
+            _check_group(
+                child,
+                context,
+                metadata,
+                probdir,
+                has_custom_grader,
+                has_default_grader,
+                input_validation,
+                output_validator,
+                work_dir,
+                diag,
             )
-            for testcase in testcases
-        ]
-        try:
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-        except VerifyError:
-            # bail_on_error (or -e with a warning): stop the rest of this group's validation.
-            for future in futures:
-                future.cancel()
-            raise
-    else:
-        for testcase in testcases:
-            _check_testcase(testcase, metadata, input_validators, output_validator, work_dir, diag)
-
-    for subgroup in subgroups:
-        _check_group(
-            subgroup,
-            context,
-            metadata,
-            probdir,
-            has_custom_grader,
-            has_default_grader,
-            input_validators,
-            output_validator,
-            work_dir,
-            diag,
-        )
+        else:
+            _check_testcase(child, metadata, input_validation, output_validator, work_dir, diag)
 
 
 def _natural_sort_le(a: str, b: str) -> bool:
@@ -252,7 +234,7 @@ def _natural_sort_le(a: str, b: str) -> bool:
 def _check_testcase(
     testcase: TestCase,
     metadata: Metadata,
-    input_validators: InputValidators,
+    input_validation: InputValidationCache,
     output_validator: Program,
     work_dir: Path,
     diag: Diagnostics,
@@ -261,7 +243,7 @@ def _check_testcase(
     _check_newlines(testcase.ansfile, diag)
     _check_size_limits(testcase.infile, diag)
     _check_size_limits(testcase.ansfile, diag)
-    check_testcase_input(input_validators, testcase, work_dir, diag)
+    input_validation.check(testcase, diag)
     anssize = testcase.ansfile.stat().st_size / 1024.0 / 1024.0
     outputlim = metadata.limits.output
     if anssize > outputlim:

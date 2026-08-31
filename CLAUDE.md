@@ -86,12 +86,7 @@ The features:
    coordination via `claim`/`complete`/`get`, with `Future`s for in-flight runs) is from master; the
    persistent `ResultCache` is the fork addition.
 
-3. **Multithreaded input validation** (`_check_group` in `checks/testdata.py`,
-   `validation_executor` in `context.py`). Test cases within a group are validated concurrently via a
-   `ThreadPoolExecutor` (sized to `os.cpu_count()`), with cancellation on `VerifyError`. (Master's
-   `-j`/`--threads` only parallelized submission running.)
-
-4. **Float-precision column(s)** (`parse_float_tolerances` / `_compute_precision` in
+3. **Float-precision column(s)** (`parse_float_tolerances` / `_compute_precision` in
    `judge/validate.py`; `max_abs_err` / `max_rel_err` / `max_best_err` on `SubmissionResult`). For
    problems using the default validator with `float_tolerance` / `float_absolute_tolerance` /
    `float_relative_tolerance`, computes per-testcase the max absolute and relative errors over float
@@ -100,7 +95,7 @@ The features:
    depending on which tolerances are configured (see `_precision_mode` in `SubtaskResultsTable`). The
    parsing and comparison mirror `default_validator.cc`.
 
-5. **Thread-safe diagnostics** (`diagnostics.py`). `_Counts` now holds a `threading.Lock` so
+4. **Thread-safe diagnostics** (`diagnostics.py`). `_Counts` now holds a `threading.Lock` so
    error/warning counters are safe under the new concurrency.
 
 ## Conventions

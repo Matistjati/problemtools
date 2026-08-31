@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import functools
 import logging
-import os
 import random
 import re
 import shutil
@@ -340,7 +338,6 @@ def main() -> None:
         threads=args.threads,
         show_subtask_scores=args.score,
         use_cache=args.cache,
-        validation_executor=concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4),
     )
     try:
         for problemdir in args.problemdir:
@@ -371,8 +368,6 @@ def main() -> None:
     except KeyboardInterrupt:
         print('\naborting...')
     finally:
-        if context.validation_executor is not None:
-            context.validation_executor.shutdown(wait=True)
         if total_errors > 0:
             sys.exit(1)
 
