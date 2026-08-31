@@ -23,11 +23,8 @@ class SubmissionResult:
         # then-max-over-testcases. None when the float-tolerance metric doesn't apply (custom
         # validator, no float flags, or structural mismatch in a WA output).
         self.max_abs_err: float | None = None  # max |judge - team|
-        self.max_abs_err_tc: TestCase | None = None
         self.max_rel_err: float | None = None  # max |judge - team| / |judge|
-        self.max_rel_err_tc: TestCase | None = None
         self.max_best_err: float | None = None  # max over tokens of min(abs_err, rel_err); both tols set
-        self.max_best_err_tc: TestCase | None = None
 
     def __str__(self) -> str:
         verdict = self.verdict

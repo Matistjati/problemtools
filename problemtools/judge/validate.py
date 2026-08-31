@@ -204,12 +204,9 @@ def _validate_output(
             triplet = _compute_precision(submission_output, testcase.ansfile, both_set)
             if triplet is not None:
                 result.max_abs_err = triplet[0]
-                result.max_abs_err_tc = testcase
                 result.max_rel_err = triplet[1]
-                result.max_rel_err_tc = testcase
                 if both_set:
                     result.max_best_err = triplet[2]
-                    result.max_best_err_tc = testcase
     return result
 
 

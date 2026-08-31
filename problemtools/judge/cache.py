@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 from ..metadata import Metadata
 from ..model import TestCase
@@ -195,6 +196,16 @@ class ResultCache:
 
         return h.hexdigest()
 
+    @staticmethod
+    def _read_entry(path: str) -> dict[str, Any] | None:
+        """The JSON entry stored at path, or None if it's missing or unreadable."""
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
     def lookup(
         self,
         sub: Program,
@@ -204,11 +215,8 @@ class ResultCache:
         timelim_high: float,
     ) -> SubmissionResult | None:
         key = self._make_key(sub, testcase, output_validator, metadata)
-        path = os.path.join(self._CACHE_DIR, f'{key}.json')
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = self._read_entry(os.path.join(self._CACHE_DIR, f'{key}.json'))
+        if data is None:
             return None
 
         cached_verdict: str = data['verdict']
@@ -234,14 +242,15 @@ class ResultCache:
         res.max_abs_err = data.get('max_abs_err')
         res.max_rel_err = data.get('max_rel_err')
         res.max_best_err = data.get('max_best_err')
-        # _tc is implicit at testcase scope: it's whatever testcase we just looked up.
-        if res.max_abs_err is not None:
-            res.max_abs_err_tc = testcase
-        if res.max_rel_err is not None:
-            res.max_rel_err_tc = testcase
-        if res.max_best_err is not None:
-            res.max_best_err_tc = testcase
         return res
+
+    def _stored_timelim(self, path: str) -> float:
+        """The time limit the entry at path was measured at, or -inf if there is no usable entry."""
+        data = self._read_entry(path)
+        if data is None:
+            return float('-inf')
+        timelim = data.get('timelim_high')
+        return timelim if isinstance(timelim, (int, float)) else float('-inf')
 
     def store(
         self,
@@ -253,6 +262,13 @@ class ResultCache:
         res_high: SubmissionResult,
     ) -> None:
         key = self._make_key(sub, testcase, output_validator, metadata)
+        path = os.path.join(self._CACHE_DIR, f'{key}.json')
+        if self._stored_timelim(path) > timelim_high:
+            # Keep the entry measured at the higher limit: it is strictly more informative.
+            # A run that finished under a high limit yields an exact runtime, reusable at every
+            # limit at or above it; a TLE carries over to every limit up to the one it was
+            # measured at. Either way, re-measuring under a tighter limit only loses reuse.
+            return
         data = {
             'verdict': res_high.verdict,
             'runtime': res_high.runtime,
@@ -264,7 +280,6 @@ class ResultCache:
             'max_best_err': res_high.max_best_err,
             'timelim_high': timelim_high,
         }
-        path = os.path.join(self._CACHE_DIR, f'{key}.json')
         tmp = f'{path}.tmp.{os.getpid()}'
         try:
             with open(tmp, 'w') as f:

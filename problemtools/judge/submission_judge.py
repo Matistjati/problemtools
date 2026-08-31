@@ -119,25 +119,41 @@ class SubmissionJudge:
             self._diag,
         )
 
+    def _run_cached(self, testcase: TestCase, timelim: float) -> SubmissionResult:
+        """Run testcase at timelim, going through the cross-run result cache.
+
+        Returns a cached result when the cache holds one that is reusable at timelim,
+        otherwise executes the submission and records the result for later runs.  JE
+        results are never cached: they say nothing about the submission.
+
+        Every path that executes a testcase goes through here, so that the cache works
+        whether or not the run is multithreaded.
+        """
+        if self._result_cache is not None:
+            cached = self._result_cache.lookup(self._sub, testcase, self._output_validator, self._metadata, timelim)
+            if cached is not None:
+                # lookup() rebuilds the result from JSON and so can't know which testcase it
+                # belongs to; execute_testcase() fills these in on the miss path.
+                cached.test_node = testcase
+                cached.runtime_testcase = testcase
+                return cached
+
+        result = self._run(testcase, timelim)
+
+        if self._result_cache is not None and result.verdict != 'JE':
+            self._result_cache.store(self._sub, testcase, self._output_validator, self._metadata, timelim, result)
+        return result
+
     def _populate_cache_for_testcase(self, testcase: TestCase, timelim: float) -> None:
         if testcase in self._cancelled:
             return
         if not self._store.claim(testcase):
             return  # duplicate testcase (same reuse_key) or already in store
 
-        if self._result_cache is not None:
-            cached = self._result_cache.lookup(self._sub, testcase, self._output_validator, self._metadata, timelim)
-            if cached is not None:
-                self._store.complete(testcase, cached, timelim)
-                return
-
         try:
-            result = self._run(testcase, timelim)
+            result = self._run_cached(testcase, timelim)
         except Exception as e:
             result = SubmissionResult('JE', reason=f'Internal error: {e}')
-
-        if self._result_cache is not None and result.verdict != 'JE':
-            self._result_cache.store(self._sub, testcase, self._output_validator, self._metadata, timelim, result)
 
         self._store.complete(testcase, result, timelim)
 
@@ -151,7 +167,7 @@ class SubmissionJudge:
         # judge() call with a timelim the store can't serve.  Claim so any pending
         # worker for it bails out rather than duplicating work.
         claimed = self._store.claim(testcase)
-        result = self._run(testcase, timelim)
+        result = self._run_cached(testcase, timelim)
         if claimed:
             self._store.complete(testcase, result, timelim)
         return result
@@ -229,21 +245,11 @@ class SubmissionJudge:
                 slowest = max(child_results, key=lambda r: r.runtime)
                 result.runtime = slowest.runtime
                 result.runtime_testcase = slowest.runtime_testcase
-                # Float-precision metrics aggregate as a max over the group's children, each
-                # carrying along the testcase that attained it.
+                # Float-precision metrics aggregate as a max over the group's children.
                 for field in ('max_abs_err', 'max_rel_err', 'max_best_err'):
-                    best_child = None
-                    best_val: float | None = None
-                    for r in child_results:
-                        v = getattr(r, field)
-                        if v is None:
-                            continue
-                        if best_val is None or v > best_val:
-                            best_val = v
-                            best_child = r
-                    if best_child is not None:
-                        setattr(result, field, best_val)
-                        setattr(result, f'{field}_tc', getattr(best_child, f'{field}_tc'))
+                    values = [v for r in child_results if (v := getattr(r, field)) is not None]
+                    if values:
+                        setattr(result, field, max(values))
                 # The grader doesn't tell us why it gave a certain result. We still want to propagate reason
                 # and additional_info. As a heuristic, look for the last entry with the same verdict as the
                 # group got, and copy from there.

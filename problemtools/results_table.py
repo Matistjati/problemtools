@@ -51,17 +51,6 @@ class SubtaskResultsTable:
         'JE': 'bold white on red',
     }
 
-    _VERDICT_ICON: ClassVar[dict[str, str]] = {
-        'AC': '✔',
-        'TLE': '⏱',
-        'OLE': '📤',
-        'MLE': '💾',
-        'RTE': '💥',
-        'WA': '✘',
-        'PAC': '~',
-        'JE': '!',
-    }
-
     _CATEGORY_ORDER: ClassVar[list[str]] = ['AC', 'PAC', 'WA', 'RTE', 'TLE']
 
     # Terminal "synchronized output" (DEC private mode 2026). Bracketing a repaint in these makes
