@@ -11,10 +11,11 @@ from pathlib import Path
 from ..context import Context
 from ..diagnostics import Diagnostics, pluralize
 from ..judge import SubmissionJudge, SubmissionResult, SubmissionsJudge
-from ..metadata import Metadata
-from ..model import DEFAULT_VALIDATOR, Graders, LegacyPolicy, Submission, Submissions, TestCase, TestDataGroup
+from ..metadata import FormatVersion, Metadata
+from ..model import DEFAULT_VALIDATOR, Graders, LegacyPolicy, Submission, Submissions, TestDataGroup
 from ..results_table import SubtaskResultsTable, get_table_groups
 from ..run import Program
+from ..submission_rules import FinalVerdictRule, Rule
 
 
 def check_submissions(
@@ -31,7 +32,8 @@ def check_submissions(
 ) -> None:
     """Run all checks on a problem's submissions."""
     policy = submissions.policy
-    known_submissions = _check_matches_policy(submissions, policy, diag)
+    rules_by_submission = _check_matches_policy(submissions, policy, testdata, metadata, diag)
+    known_submissions = list(rules_by_submission)
     included_submissions = [s for s in known_submissions if context.submission_filter.search(str(s.path))]
     ignored_submissions = len(known_submissions) - len(included_submissions)
     msg = f'Checking {pluralize(len(included_submissions), "submission")}'
@@ -80,9 +82,8 @@ def check_submissions(
             lower_bound_submissions = [sub for sub in included_submissions if policy.lower_bounds_time_limit(sub)]
             all_submission_results = _check_submission_group(
                 lower_bound_submissions,
-                policy,
+                rules_by_submission,
                 metadata,
-                testdata,
                 submissions_judge,
                 probdir,
                 seen_oob_score_groups,
@@ -112,14 +113,16 @@ def check_submissions(
             # Run TLE submissions last (as they're presumably the slowest)
             rest = sorted(
                 (sub for sub in included_submissions if sub not in lower_bound_submissions),
-                key=lambda sub: (policy.expected_verdict(sub) == 'TLE', str(sub.path)),
+                key=lambda sub: (
+                    any(isinstance(r, FinalVerdictRule) and r.verdict == 'TLE' for r in rules_by_submission[sub]),
+                    str(sub.path),
+                ),
             )
             all_submission_results.extend(
                 _check_submission_group(
                     rest,
-                    policy,
+                    rules_by_submission,
                     metadata,
-                    testdata,
                     submissions_judge,
                     probdir,
                     seen_oob_score_groups,
@@ -143,23 +146,26 @@ def _check_has_accepted_submission(submissions: Submissions, diag: Diagnostics) 
         diag.error('Require at least one "accepted" submission')
 
 
-def _check_matches_policy(submissions: Submissions, policy: LegacyPolicy, diag: Diagnostics) -> list[Submission]:
-    """Emit an error for, and exclude, any submission that doesn't match the policy at all
-    (i.e. sits in an unrecognized directory). Such a submission is never compiled or tested."""
-    matched = []
+def _check_matches_policy(
+    submissions: Submissions, policy: LegacyPolicy, testdata: TestDataGroup, metadata: Metadata, diag: Diagnostics
+) -> dict[Submission, list[Rule]]:
+    """Get the rules for every submission matching the policy. Emit an error for, and exclude, any
+    submission that doesn't match the policy at all (i.e. sits in an unrecognized directory). Such
+    a submission is never compiled or tested."""
+    rules_by_submission = {}
     for sub in submissions.submissions:
-        if policy.matches(sub):
-            matched.append(sub)
+        rules = policy.rules_for(sub, testdata, metadata)
+        if rules is not None:
+            rules_by_submission[sub] = rules
         else:
             diag.error(f'Submission {sub.path} does not match any known submissions directory; ignoring it')
-    return matched
+    return rules_by_submission
 
 
 def _check_submission_group(
     subs: list[Submission],
-    policy: LegacyPolicy,
+    rules_by_submission: dict[Submission, list[Rule]],
     metadata: Metadata,
-    testdata: TestDataGroup,
     submissions_judge: SubmissionsJudge,
     probdir: Path,
     seen_oob_score_groups: set[int],
@@ -195,35 +201,33 @@ def _check_submission_group(
         sub_results = _check_submission(
             sub,
             judge,
-            policy,
+            rules_by_submission[sub],
             metadata,
-            testdata,
             probdir,
             seen_oob_score_groups,
             timelim,
             timelim_high,
             diag,
             results_table,
-            _table_category(sub, policy),
+            _table_category(sub, rules_by_submission[sub]),
         )
         submission_results.append((sub, sub_results))
 
     return submission_results
 
 
-def _table_category(sub: Submission, policy: LegacyPolicy) -> str:
+def _table_category(sub: Submission, rules: list[Rule]) -> str:
     """Which verdict group the submission's row belongs to in the live results table."""
     if sub.directory == 'partially_accepted':
         return 'PAC'
-    return policy.expected_verdict(sub) or 'AC'
+    return next((r.verdict for r in rules if isinstance(r, FinalVerdictRule) and r.scope == ''), 'AC')
 
 
 def _check_submission(
     sub: Submission,
     judge: SubmissionJudge,
-    policy: LegacyPolicy,
+    rules: list[Rule],
     metadata: Metadata,
-    testdata: TestDataGroup,
     probdir: Path,
     seen_oob_score_groups: set[int],
     timelim: float,
@@ -232,15 +236,9 @@ def _check_submission(
     results_table: SubtaskResultsTable | None = None,
     label: str = 'AC',
 ) -> list[SubmissionResult]:
-    expected_verdict = policy.expected_verdict(sub)
-    assert expected_verdict is not None, '_check_submission called on a submission not matching the policy'
-    partial = sub.directory == 'partially_accepted'
-    desc = str(sub)
-
     results_high = judge.judge(timelim_high)
     if not results_high:
         diag.fatal('_check_submission called, but found no test cases to run on.')
-    result_high = results_high[-1]
 
     results = judge.judge(timelim)
     result = results[-1]
@@ -251,42 +249,19 @@ def _check_submission(
             if r.score is not None and isinstance(r.test_node, TestDataGroup):
                 _check_score_in_bounds(r.test_node, sub.program, r.score, probdir, seen_oob_score_groups, diag)
 
-    # Warn if AC (but not PAC) submissions fail on samples. It's not uncommon for sample cases to be
-    # ignored, so failing on them could be silent otherwise. Skip warning if the result isn't AC -
-    # then something worse has gone wrong, and we'll error later.
-    if expected_verdict == 'AC' and not partial and result.verdict == 'AC':
-        if sample_failure := _find_sample_failure(results):
-            diag.warning(f'{desc} got {sample_failure.verdict} on sample: {sample_failure}')
+    time_limit_sensitivity = _time_limit_sensitivity(judge, results_high, timelim, timelim_high, sub, metadata)
 
-    # Warn if a PAC submission would affect time limit, had it been use to compute the time limit. Only do this
-    # if it gets AC on the computed time limit, otherwise we have other warnings below.
-    if partial and result.verdict == 'AC':
-        _warn_pac_too_slow(judge, results, timelim, desc, metadata, diag)
-
-    if result.verdict != result_high.verdict or result.score != result_high.score:
-        diag.warning(
-            f'{desc} sensitive to time limit: limit of {timelim} secs -> {result}, limit of {timelim_high} secs -> {result_high}'
-        )
-
-    if partial and _fully_accepted(result, testdata, metadata):
-        diag.warning(f'{desc} was fully accepted: {result}')
-    elif result.verdict == expected_verdict:
-        # The results table already shows this, per subtask; don't repeat it as a line of text.
-        if results_table is None:
-            diag.msg(f'   {desc} OK: {result}')
-        if (
-            not partial
-            and expected_verdict == 'AC'
-            and not _fully_accepted(result, testdata, metadata)
-            and _full_score_finite(testdata, metadata)
-        ):
-            # For some heuristic problems, this is expected. Thus, only warn.
-            diag.warning(f'{desc} did not attain full score (consider moving it to partially_accepted)')
-    elif result_high.verdict == expected_verdict and not (partial and _fully_accepted(result_high, testdata, metadata)):
-        if results_table is None:
-            diag.msg(f'   {desc} OK with extra time: {result_high}')
-    else:
-        diag.error(f'{desc} got {result}', result_high.additional_info)
+    # Use a list rather than any() on a generator, so that every rule gets checked
+    reported_errors = [rule.check(sub, results, diag) for rule in rules]
+    if time_limit_sensitivity is not None:
+        if any(reported_errors):
+            # Already reported as an error, but knowing how the result depends on the time limit may help fix it
+            diag.msg(f'   {time_limit_sensitivity}')
+        else:
+            diag.warning(time_limit_sensitivity)
+    # The results table already shows this, per subtask; don't repeat it as a line of text.
+    if not any(reported_errors) and results_table is None:
+        diag.msg(f'   {sub} OK: {result}')
 
     if results_table is not None:
         results_table.add_row(sub, results, label)
@@ -314,24 +289,54 @@ def _check_score_in_bounds(
     )
 
 
-def _find_sample_failure(results: list[SubmissionResult]) -> SubmissionResult | None:
-    for r in results:
-        if r.verdict != 'AC' and isinstance(r.test_node, TestCase) and r.test_node.is_in_sample_group():
-            return r
-    return None
+def _same_result(a: SubmissionResult, b: SubmissionResult) -> bool:
+    return a.verdict == b.verdict and a.score == b.score
 
 
-def _warn_pac_too_slow(
-    judge: SubmissionJudge, results: list[SubmissionResult], timelim: float, desc: str, metadata: Metadata, diag: Diagnostics
-) -> None:
-    """Warn if a PAC submission is slow enough that it would have affected the time limit."""
-    runtime_without_affecting_tl = timelim / metadata.limits.time_multipliers.ac_to_time_limit
-    if judge.judge(runtime_without_affecting_tl)[-1].verdict == 'AC':
-        return
-    for t in sorted(r.runtime for r in results if r.runtime > runtime_without_affecting_tl):
-        if judge.judge(t)[-1].verdict == 'AC':
-            diag.warning(f'{desc} is slower than all AC submissions. It needs {t:.2f}s to get AC')
-            return
+def _time_limit_sensitivity(
+    judge: SubmissionJudge,
+    results_high: list[SubmissionResult],
+    timelim: float,
+    timelim_high: float,
+    sub: Submission,
+    metadata: Metadata,
+) -> str | None:
+    """Describe how sub's result changes for time limits between lo and timelim_high, listing each runtime where
+    it changes, or None if it doesn't change. lo is the largest runtime that wouldn't have affected the time limit,
+    had the submission been used to compute it."""
+    multipliers = metadata.limits.time_multipliers
+    lo = timelim / multipliers.ac_to_time_limit
+    steps = [(lo, judge.judge(lo)[-1])]
+    # Only try the largest runtime per printed value, so we don't list several changes at the same printed time
+    runtimes: dict[str, float] = {}
+    for r in results_high:
+        if lo < r.runtime <= timelim_high:
+            runtimes[f'{r.runtime:.2f}'] = max(r.runtime, runtimes.get(f'{r.runtime:.2f}', 0))
+    for t in sorted(runtimes.values()):
+        result = judge.judge(t)[-1]
+        if not _same_result(result, steps[-1][1]):
+            steps.append((t, result))
+
+    def fmt(result: SubmissionResult) -> str:
+        return result.format(fields=['score'])
+
+    if len(steps) == 1:
+        return None
+    if len(steps) == 2:
+        t, result = steps[1]
+        if t > timelim:
+            return f'{sub} would get {fmt(result)} with time limit >= {t:.2f}s'
+        factor_name = 'time_multiplier' if metadata.problem_format_version == FormatVersion.LEGACY else 'ac_to_time_limit'
+        return (
+            f'{sub} is within {factor_name} ({_fmt_number(multipliers.ac_to_time_limit)}) of time limit '
+            f'{_fmt_number(timelim)}s. It takes {t:.2f}s to get {fmt(result)}.'
+        )
+    parts = []
+    for i, (t, result) in enumerate(steps):
+        if i > 0 and steps[i - 1][0] <= timelim < t:
+            parts.append(f'[time limit {_fmt_number(timelim)}s]')
+        parts.append(f'{t:.2f}s -> {fmt(result)}')
+    return f'{sub} is sensitive to time limit. {", ".join(parts)}'
 
 
 def _print_results_table(
@@ -440,20 +445,6 @@ def _compute_time_limit(
         f'safety margin to {_fmt_number(timelim_high)} secs'
     )
     return timelim, timelim_high
-
-
-def _full_score_finite(testdata: TestDataGroup, metadata: Metadata) -> bool:
-    min_score, max_score = testdata.get_score_range()
-    if metadata.legacy_grading.objective == 'min':
-        return min_score != float('-inf')
-    else:
-        return max_score != float('inf')
-
-
-def _fully_accepted(result: SubmissionResult, testdata: TestDataGroup, metadata: Metadata) -> bool:
-    min_score, max_score = testdata.get_score_range()
-    best_score = min_score if metadata.legacy_grading.objective == 'min' else max_score
-    return result.verdict == 'AC' and (not metadata.is_scoring() or result.score == best_score)
 
 
 def _fmt_number(number: float | None) -> str:
