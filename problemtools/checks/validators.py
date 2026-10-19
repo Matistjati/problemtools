@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import random
 import re
 import string
 import tempfile
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
 from re import Match
 
@@ -19,7 +19,7 @@ from ..formatversion import FormatVersion
 from ..judge import SubmissionResult, validate_output
 from ..metadata import Metadata
 from ..model import InputValidators, OutputValidators, TestCase, TestDataGroup
-from ..run import ProgramError, SourceCode
+from ..run import Executable, SourceCode
 
 # Junk data. The validator should reject these cases
 _JUNK_CASES: list[tuple[str, bytes]] = [
@@ -78,6 +78,15 @@ _JUNK_MODIFICATIONS = [
 ]
 
 
+@contextmanager
+def _temp_file_with(data: bytes, work_dir: Path) -> Iterator[Path]:
+    """Yield the path to a temporary file in work_dir containing data, deleted on exit."""
+    with tempfile.NamedTemporaryFile(dir=work_dir) as f:
+        f.write(data)
+        f.flush()
+        yield Path(f.name)
+
+
 def _error_in_2023_07(format_version: FormatVersion, diag: Diagnostics, msg: str, additional_info: str | None = None) -> None:
     if format_version is FormatVersion.LEGACY:
         diag.warning(msg, additional_info)
@@ -92,13 +101,13 @@ def check_input_validators(validators: InputValidators, testdata: TestDataGroup,
     if len(validators.validators) == 0:
         diag.error('No input format validators found')
 
+    executables: list[Executable] = []
     for val in validators.validators:
-        try:
-            result = val.compile(work_dir)
-            if not result.success:
-                diag.error(f'Compile error for {val}', result.errmsg)
-        except ProgramError as e:
-            diag.error(str(e))
+        result = val.compile(work_dir)
+        if result.executable is None:
+            diag.error(f'Compile error for {val}', result.errmsg)
+        else:
+            executables.append(result.executable)
 
     # Only sanity check input validators if they all actually compiled
     if diag.errors != errors_before:
@@ -114,20 +123,15 @@ def check_input_validators(validators: InputValidators, testdata: TestDataGroup,
 
     collect_flags(testdata, all_flags)
 
-    fd, tmp_name = tempfile.mkstemp()
-    os.close(fd)
-    file_name = Path(tmp_name)
     for desc, case in _JUNK_CASES:
-        with open(file_name, 'wb') as f:
-            f.write(case)
-        for flags_str in all_flags:
-            flags = flags_str.split()
-            for val in validators.validators:
-                status, _ = val.run(file_name, args=flags, work_dir=work_dir)
-                if os.WEXITSTATUS(status) != 42:
-                    break
-            else:
-                diag.warning(f'No validator rejects {desc} with flags "{" ".join(flags)}"')
+        with _temp_file_with(case, work_dir) as junk_file:
+            for flags_str in all_flags:
+                flags = flags_str.split()
+                for executable in executables:
+                    if executable.run(junk_file, args=flags, work_dir=work_dir).exitcode != 42:
+                        break
+                else:
+                    diag.warning(f'No validator rejects {desc} with flags "{" ".join(flags)}"')
 
     def modified_input_validates(applicable: Callable[[str], bool], modifier: Callable[[str], str]) -> bool:
         for testcase in testdata.get_all_testcases():
@@ -139,16 +143,13 @@ def check_input_validators(validators: InputValidators, testdata: TestDataGroup,
             except UnicodeDecodeError:
                 continue
 
-            with open(file_name, 'wb') as f:
-                f.write(modifier(infile_data).encode('utf8'))
-
-            for flags_str in all_flags:
-                flags = flags_str.split()
-                for val in validators.validators:
-                    status, _ = val.run(file_name, args=flags, work_dir=work_dir)
-                    if os.WEXITSTATUS(status) != 42:
-                        # expected behavior; validator rejects modified input
-                        return False
+            with _temp_file_with(modifier(infile_data).encode('utf8'), work_dir) as modified_file:
+                for flags_str in all_flags:
+                    flags = flags_str.split()
+                    for executable in executables:
+                        if executable.run(modified_file, args=flags, work_dir=work_dir).exitcode != 42:
+                            # expected behavior; validator rejects modified input
+                            return False
 
             # we found a file we could modify, and all validators
             # accepted the modifications
@@ -160,8 +161,6 @@ def check_input_validators(validators: InputValidators, testdata: TestDataGroup,
     for desc, applicable, modifier in _JUNK_MODIFICATIONS:
         if modified_input_validates(applicable, modifier):
             diag.warning(f'No validator rejects {desc}')
-
-    os.unlink(file_name)
 
 
 def _compute_testcase_input_errors(
@@ -186,21 +185,18 @@ def _run_input_validators(validators: InputValidators, testcase: TestCase, work_
 
     for val in validators.validators:
         # A validator that failed to compile was already reported by check_input_validators; skip it.
-        if not val.compile(work_dir).success:
+        executable = val.compile(work_dir).executable
+        if executable is None:
             continue
 
-        with tempfile.NamedTemporaryFile() as outfile, tempfile.NamedTemporaryFile() as errfile:
-            status, _ = val.run(testcase.infile, Path(outfile.name), Path(errfile.name), args=flags, work_dir=work_dir)
-            if not os.WIFEXITED(status):
-                emsg = f'Input format validator {val} crashed on input {testcase.infile}'
-            elif os.WEXITSTATUS(status) != 42:
-                emsg = f'Input format validator {val} did not accept input {testcase.infile}, exit code: {os.WEXITSTATUS(status)}'
-            else:
-                continue
-            validator_stdout = outfile.read().decode('utf-8', 'replace')
-            validator_stderr = errfile.read().decode('utf-8', 'replace')
-            validator_output = '\n'.join(out for out in [validator_stdout, validator_stderr] if out)
-            errors.append((emsg, validator_output))
+        result = executable.run_capture(work_dir, testcase.infile, args=flags, work_dir=work_dir)
+        if result.exitcode is None:
+            emsg = f'Input format validator {val} crashed on input {testcase.infile} ({result})'
+        elif result.exitcode != 42:
+            emsg = f'Input format validator {val} did not accept input {testcase.infile}, exit code: {result.exitcode}'
+        else:
+            continue
+        errors.append((emsg, result.output))
     return errors
 
 
@@ -271,8 +267,6 @@ def check_output_validators(
             format_version, diag, f'Support for multiple output validators has been dropped. will only use {selected}'
         )
 
-    if selected is None:
-        diag.fatal('Unable to locate default validator')
     diag.msg('Checking output validator')
 
     safe_output_validator_languages = {'c', 'cpp', 'python3'}
@@ -289,12 +283,10 @@ def check_output_validators(
     elif not validators.uses_default(format_version, metadata) and not validators.validators:
         diag.fatal('problem.yaml specifies custom validator but no validator programs found')
 
-    try:
-        result = selected.compile(work_dir)
-        if not result.success:
-            diag.fatal(f'Compile error for output validator {selected}', result.errmsg)
-    except ProgramError as e:
-        diag.fatal(f'Compile error for output validator {selected}', str(e))
+    compile_result = selected.compile(work_dir)
+    executable = compile_result.executable
+    if executable is None:
+        diag.fatal(f'Compile error for output validator {selected}', compile_result.errmsg)
 
     # Only sanity check output validators if they all actually compiled
     if diag.errors != errors_before:
@@ -302,14 +294,12 @@ def check_output_validators(
 
     def run_junk_case(case_desc: str, junk_content: bytes, testcases: list[TestCase]) -> list[SubmissionResult]:
         results = []
-        with tempfile.NamedTemporaryFile(mode='wb') as f:
-            f.write(junk_content)
-            f.flush()
+        with _temp_file_with(junk_content, work_dir) as junk_file:
             for testcase in testcases:
                 result = validate_output(
                     testcase=testcase,
-                    submission_output=Path(f.name),
-                    output_validator=selected,
+                    submission_output=junk_file,
+                    output_validator=executable,
                     metadata=metadata,
                     base_dir=work_dir,
                     diag=diag,

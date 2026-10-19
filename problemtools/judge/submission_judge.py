@@ -10,7 +10,7 @@ from ..context import Context
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
 from ..model import DEFAULT_GRADER, Graders, Submission, TestCase, TestDataGroup
-from ..run import CompileResult, Program
+from ..run import CompileResult, Executable, Program
 from .cache import ResultCache, ResultStore
 from .execute import execute_testcase
 from .grade import grade_group
@@ -55,14 +55,15 @@ class SubmissionJudge:
 
     def __init__(
         self,
-        sub: Program,
-        output_validator: Program,
+        sub: Executable,
+        output_validator: Executable,
         metadata: Metadata,
         root: TestDataGroup,
         base_dir: Path,
         context: Context,
         graders: Graders,
         diag: Diagnostics,
+        result_cache: ResultCache | None = None,
     ) -> None:
         self._sub = sub
         self._output_validator = output_validator
@@ -72,9 +73,7 @@ class SubmissionJudge:
         self._diag = diag
         self._graders = graders
         self._store = ResultStore()
-        # Cross-run cache. Interactive problems aren't cacheable: their result depends on the
-        # interactor's behaviour, which we don't hash.
-        self._result_cache = ResultCache() if context.use_cache and not metadata.is_interactive() else None
+        self._result_cache = result_cache
         self._root = root
         self._cancelled = _Cancelled()
         self._precompute_started = False
@@ -130,7 +129,7 @@ class SubmissionJudge:
         whether or not the run is multithreaded.
         """
         if self._result_cache is not None:
-            cached = self._result_cache.lookup(self._sub, testcase, self._output_validator, self._metadata, timelim)
+            cached = self._result_cache.lookup(testcase, self._metadata, timelim)
             if cached is not None:
                 # lookup() rebuilds the result from JSON and so can't know which testcase it
                 # belongs to; execute_testcase() fills these in on the miss path.
@@ -141,7 +140,7 @@ class SubmissionJudge:
         result = self._run(testcase, timelim)
 
         if self._result_cache is not None and result.verdict != 'JE':
-            self._result_cache.store(self._sub, testcase, self._output_validator, self._metadata, timelim, result)
+            self._result_cache.store(testcase, self._metadata, timelim, result)
         return result
 
     def _populate_cache_for_testcase(self, testcase: TestCase, timelim: float) -> None:
@@ -276,15 +275,19 @@ class SubmissionsJudge:
     def __init__(
         self,
         root: TestDataGroup,
-        output_validator: Program,
+        output_validator: Executable,
         metadata: Metadata,
         base_dir: Path,
         context: Context,
         graders: Graders,
         diag: Diagnostics,
+        output_validator_program: Program | None = None,
     ) -> None:
+        """output_validator_program is the Program output_validator was compiled from. The
+        cross-run result cache keys on it, so the cache is only used when it is given."""
         self._root = root
         self._output_validator = output_validator
+        self._output_validator_program = output_validator_program
         self._metadata = metadata
         self._base_dir = base_dir
         self._context = context
@@ -304,10 +307,19 @@ class SubmissionsJudge:
         for sub in submissions:
             result = sub.program.compile(self._base_dir)
             outcomes[sub] = result
-            if result.success:
+            if result.executable is not None:
                 assert sub not in self._judges, f'precompute() called more than once for submission {sub}'
+                # Interactive problems aren't cacheable: their result depends on the
+                # interactor's behaviour, which we don't hash.
+                result_cache = (
+                    ResultCache(sub.program, self._output_validator_program)
+                    if self._context.use_cache
+                    and self._output_validator_program is not None
+                    and not self._metadata.is_interactive()
+                    else None
+                )
                 judge = SubmissionJudge(
-                    sub=sub.program,
+                    sub=result.executable,
                     output_validator=self._output_validator,
                     metadata=self._metadata,
                     root=self._root,
@@ -315,6 +327,7 @@ class SubmissionsJudge:
                     context=self._context,
                     graders=self._graders,
                     diag=self._diag,
+                    result_cache=result_cache,
                 )
                 self._judges[sub] = judge
                 if self._context.executor is not None:
@@ -333,10 +346,11 @@ class SubmissionsJudgeFactory(Protocol):
     def __call__(
         self,
         root: TestDataGroup,
-        output_validator: Program,
+        output_validator: Executable,
         metadata: Metadata,
         base_dir: Path,
         context: Context,
         graders: Graders,
         diag: Diagnostics,
+        output_validator_program: Program | None = None,
     ) -> SubmissionsJudge: ...

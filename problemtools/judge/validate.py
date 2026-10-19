@@ -7,7 +7,7 @@ from pathlib import Path
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
 from ..model import DEFAULT_VALIDATOR, TestCase
-from ..run import Program
+from ..run import Executable, RunResult
 from .result import SubmissionResult
 
 _PRECISION_MAX_TOKENS = 1_000_000
@@ -111,29 +111,21 @@ def _get_feedback(feedback_dir: Path) -> str | None:
 
 
 def _parse_validator_result(
-    val: Program,
-    status: int,
+    val: Executable,
+    val_result: RunResult,
     feedback_dir: Path,
     metadata: Metadata,
 ) -> SubmissionResult:
-    if not os.WIFEXITED(status):
+    if val_result.exitcode not in [42, 43]:
         return SubmissionResult(
             'JE',
-            reason=f'output validator {val} crashed, status {status}',
-            additional_info=_get_feedback(feedback_dir),
-        )
-
-    ret = os.WEXITSTATUS(status)
-    if ret not in [42, 43]:
-        return SubmissionResult(
-            'JE',
-            reason=f'output validator {val} exited with status {ret}',
+            reason=f'output validator {val} failed ({val_result})',
             additional_info=_get_feedback(feedback_dir),
         )
 
     score_file = feedback_dir / 'score.txt'
 
-    if ret == 43:
+    if val_result.exitcode == 43:
         if score_file.is_file():
             return SubmissionResult('JE', reason='validator produced "score.txt" on a WA verdict')
         return SubmissionResult('WA', additional_info=_get_feedback(feedback_dir))
@@ -159,10 +151,9 @@ def _parse_validator_result(
 def _validate_output(
     testcase: TestCase,
     submission_output: Path,
-    output_validator: Program,
+    output_validator: Executable,
     metadata: Metadata,
     execution_dir: Path,
-    base_dir: Path,
     diag: Diagnostics,
     infile: Path | None = None,
 ) -> SubmissionResult:
@@ -178,11 +169,9 @@ def _validate_output(
             'OLE', reason=f'output ({output_size:.1f} MiB) exceeds output limit ({metadata.limits.output} MiB)'
         )
 
-    if not output_validator.compile(base_dir).success:
-        return SubmissionResult('JE', reason=f'output validator {output_validator} failed to compile')
     val_stdout = execution_dir / 'val_stdout'
     val_stderr = execution_dir / 'val_stderr'
-    status, _ = output_validator.run(
+    val_result = output_validator.run(
         infile=submission_output,
         args=[str(effective_infile), str(testcase.ansfile), str(feedback_dir) + os.sep] + flags,
         timelim=val_timelim,
@@ -196,8 +185,9 @@ def _validate_output(
                 diag.debug(f'Validator {label}: {content}')
         except OSError as e:
             diag.info(f'Failed to read validator output: {e}')
-    result = _parse_validator_result(output_validator, status, feedback_dir, metadata)
-    if result.verdict in ('AC', 'WA') and output_validator is DEFAULT_VALIDATOR:
+    result = _parse_validator_result(output_validator, val_result, feedback_dir, metadata)
+    # DEFAULT_VALIDATOR is a Tool, which hands out the same Executable every time it is compiled.
+    if result.verdict in ('AC', 'WA') and output_validator is DEFAULT_VALIDATOR.executable:
         abs_tol, rel_tol = parse_float_tolerances(flags)
         if abs_tol is not None or rel_tol is not None:
             both_set = abs_tol is not None and rel_tol is not None
@@ -213,7 +203,7 @@ def _validate_output(
 def validate_output(
     testcase: TestCase,
     submission_output: Path,
-    output_validator: Program,
+    output_validator: Executable,
     metadata: Metadata,
     base_dir: Path,
     diag: Diagnostics,
@@ -221,4 +211,4 @@ def validate_output(
     with tempfile.TemporaryDirectory(dir=base_dir) as exec_dir:
         execution_dir = Path(exec_dir)
         (execution_dir / 'feedback').mkdir()
-        return _validate_output(testcase, submission_output, output_validator, metadata, execution_dir, base_dir, diag)
+        return _validate_output(testcase, submission_output, output_validator, metadata, execution_dir, diag)

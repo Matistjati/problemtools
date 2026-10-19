@@ -27,31 +27,21 @@ from pathlib import Path
 from ..diagnostics import Diagnostics
 from ..metadata import Metadata
 from ..model import TestCase
-from ..run import Program, get_tool
+from ..run import Executable, RunResult, get_tool
 from .result import SubmissionResult
 from .validate import _parse_validator_result, _validate_output
 
 _INTERACTIVE_OUTPUT_RE = re.compile(r'\d+ \d+\.\d+ \d+ \d+\.\d+ (validator|submission)')
 
-
-def _is_TLE(status: int, may_signal_with_usr1: bool = False) -> bool:
-    return os.WIFSIGNALED(status) and (
-        os.WTERMSIG(status) == signal.SIGXCPU or (may_signal_with_usr1 and os.WTERMSIG(status) == signal.SIGUSR1)
-    )
+_INTERACTIVE = get_tool('interactive').executable
 
 
-def _is_RTE(status: int) -> bool:
-    return not os.WIFEXITED(status) or bool(os.WEXITSTATUS(status))
+def _is_TLE(result: RunResult, may_signal_with_usr1: bool = False) -> bool:
+    return result.signal == signal.SIGXCPU or (may_signal_with_usr1 and result.signal == signal.SIGUSR1)
 
 
-def _rte_reason(status: int) -> str:
-    if os.WIFSIGNALED(status):
-        sig = os.WTERMSIG(status)
-        try:
-            return signal.Signals(sig).name
-        except ValueError:
-            return f'SIG{sig}'
-    return f'Exit {os.WEXITSTATUS(status)}'
+def _is_RTE(result: RunResult) -> bool:
+    return result.exitcode != 0
 
 
 def _read_safe(path: Path) -> str | None:
@@ -64,62 +54,53 @@ def _read_safe(path: Path) -> str | None:
 def _run_normal(
     infile: Path,
     testcase: TestCase,
-    sub: Program,
-    output_validator: Program,
+    sub: Executable,
+    output_validator: Executable,
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
-    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (non-interactive)"""
     outfile = execution_dir / 'submission_stdout'
     errfile = execution_dir / 'submission_stderr'
-    sub_path = sub.compile(base_dir).path
-    status, runtime = sub.run(
+    sub_result = sub.run(
         infile=infile,
         outfile=outfile,
         errfile=errfile,
         timelim=math.ceil(timelim) + 1,
         memlim=metadata.limits.memory,
-        work_dir=sub_path,
+        work_dir=sub.build_dir,
     )
-    if _is_TLE(status) or runtime > timelim:
+    if _is_TLE(sub_result) or sub_result.runtime > timelim:
         result = SubmissionResult('TLE')
-    elif _is_RTE(status):
-        result = SubmissionResult('RTE', reason=_rte_reason(status), additional_info=_read_safe(errfile))
+    elif _is_RTE(sub_result):
+        result = SubmissionResult('RTE', reason=str(sub_result), additional_info=_read_safe(errfile))
     else:
-        result = _validate_output(testcase, outfile, output_validator, metadata, execution_dir, base_dir, diag, infile=infile)
-    result.runtime = runtime
+        result = _validate_output(testcase, outfile, output_validator, metadata, execution_dir, diag, infile=infile)
+    result.runtime = sub_result.runtime
     return result
 
 
 def _run_interactive(
     infile: Path,
     testcase: TestCase,
-    sub: Program,
-    output_validator: Program,
+    sub: Executable,
+    output_validator: Executable,
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
-    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (interactive)"""
-    interactive = get_tool('interactive')
-    if interactive is None:
+    if _INTERACTIVE is None:
         diag.error('Could not locate interactive runner')
         return SubmissionResult('JE', reason='Could not locate interactive runner')
-
-    if not output_validator.compile(base_dir).success:
-        return SubmissionResult('JE', reason=f'output validator {output_validator} failed to compile')
-
-    sub_path = sub.compile(base_dir).path
 
     feedback_dir = execution_dir / 'feedback'
     interactive_out = execution_dir / 'interactive_output'
 
-    i_status, _ = interactive.run(
+    i_result = _INTERACTIVE.run(
         outfile=interactive_out,
         args=(
             ['1', str(math.ceil(2 * timelim))]
@@ -129,12 +110,12 @@ def _run_interactive(
             + [';']
             + sub.get_runcmd(memlim=metadata.limits.memory)
         ),
-        work_dir=sub_path,
+        work_dir=sub.build_dir,
     )
 
-    if _is_RTE(i_status):
-        diag.error(f'Interactive runner crashed, status {i_status}')
-        return SubmissionResult('JE', reason=f'Interactive runner crashed, status {i_status}')
+    if _is_RTE(i_result):
+        diag.error(f'Interactive runner failed ({i_result})')
+        return SubmissionResult('JE', reason=f'Interactive runner failed ({i_result})')
 
     output = interactive_out.read_text()
     diag.debug(f'Interactive output: "{output}"')
@@ -143,26 +124,26 @@ def _run_interactive(
         diag.error(f'Interactive runner produced unexpected output: "{output}"')
         return SubmissionResult('JE', reason=f'Interactive runner produced unexpected output: "{output}"')
 
-    val_status_str, _, sub_status_str, sub_runtime_str, first = output.split()
-    val_status = int(val_status_str)
-    sub_status = int(sub_status_str)
-    sub_runtime = float(sub_runtime_str)
+    val_status_str, val_runtime_str, sub_status_str, sub_runtime_str, first = output.split()
+    val_result = RunResult(int(val_status_str), float(val_runtime_str))
+    sub_result = RunResult(int(sub_status_str), float(sub_runtime_str))
+    sub_runtime = sub_result.runtime
 
-    val_JE = not os.WIFEXITED(val_status) or os.WEXITSTATUS(val_status) not in [42, 43]
-    val_WA = os.WIFEXITED(val_status) and os.WEXITSTATUS(val_status) == 43
+    val_JE = val_result.exitcode not in [42, 43]
+    val_WA = val_result.exitcode == 43
 
     if val_JE or (val_WA and first == 'validator'):
         # Validator crashed or exited first with WA — follow validator verdict.
         # Cap runtime, as the submission can behave erratically and time out
         # after the validator exited.
-        result = _parse_validator_result(output_validator, val_status, feedback_dir, metadata)
+        result = _parse_validator_result(output_validator, val_result, feedback_dir, metadata)
         sub_runtime = min(sub_runtime, timelim)
-    elif _is_TLE(sub_status, may_signal_with_usr1=True) or sub_runtime > timelim:
+    elif _is_TLE(sub_result, may_signal_with_usr1=True) or sub_runtime > timelim:
         result = SubmissionResult('TLE')
-    elif _is_RTE(sub_status):
-        result = SubmissionResult('RTE', reason=_rte_reason(sub_status))
+    elif _is_RTE(sub_result):
+        result = SubmissionResult('RTE', reason=str(sub_result))
     else:
-        result = _parse_validator_result(output_validator, val_status, feedback_dir, metadata)
+        result = _parse_validator_result(output_validator, val_result, feedback_dir, metadata)
 
     result.runtime = sub_runtime
     result.validator_first = first == 'validator'
@@ -172,35 +153,33 @@ def _run_interactive(
 def _run_pass(
     infile: Path,
     testcase: TestCase,
-    sub: Program,
-    output_validator: Program,
+    sub: Executable,
+    output_validator: Executable,
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
-    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     """Run a submission once (the common case, or one pass for a multi-pass problem)"""
     if metadata.is_interactive():
-        return _run_interactive(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
-    return _run_normal(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
+        return _run_interactive(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
+    return _run_normal(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
 
 
 def _run_multipass(
     testcase: TestCase,
-    sub: Program,
-    output_validator: Program,
+    sub: Executable,
+    output_validator: Executable,
     metadata: Metadata,
     timelim: float,
     execution_dir: Path,
-    base_dir: Path,
     diag: Diagnostics,
 ) -> SubmissionResult:
     infile: Path = testcase.infile
     slowest = 0.0
     feedback_dir = execution_dir / 'feedback'
     for _ in range(metadata.limits.validation_passes):
-        result = _run_pass(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
+        result = _run_pass(infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
         slowest = max(slowest, result.runtime)
         result.runtime = slowest
         nextpass = feedback_dir / 'nextpass.in'
@@ -217,8 +196,8 @@ def _run_multipass(
 
 def execute_testcase(
     testcase: TestCase,
-    sub: Program,
-    output_validator: Program,
+    sub: Executable,
+    output_validator: Executable,
     metadata: Metadata,
     timelim: float,
     base_dir: Path,
@@ -229,9 +208,9 @@ def execute_testcase(
         execution_dir = Path(exec_dir)
         (execution_dir / 'feedback').mkdir()
         if metadata.is_multi_pass():
-            result = _run_multipass(testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
+            result = _run_multipass(testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
         else:
-            result = _run_pass(testcase.infile, testcase, sub, output_validator, metadata, timelim, execution_dir, base_dir, diag)
+            result = _run_pass(testcase.infile, testcase, sub, output_validator, metadata, timelim, execution_dir, diag)
     result.test_node = testcase
     result.runtime_testcase = testcase
     return result

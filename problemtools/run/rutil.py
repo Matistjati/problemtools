@@ -1,51 +1,27 @@
 """Some utility functions for the run module."""
 
-import errno
 import os
-import shutil
+import stat
 from pathlib import Path
 
-from .errors import ProgramError
 
+def check_build_dir(build_dir: Path) -> str | None:
+    """Check that a build only produced regular files and directories.
 
-def add_files(src: Path, dstdir: Path) -> None:
-    """Copy src to dstdir.
-
-    Args:
-        src: path of file(s) to copy.
-            If path is a file, that file will simply be copied to
-            dstdir.
-            If path is a directory, then every entry (both files and
-            subdirectories) in that directory will be copied to
-            dstdir.
-        dstdir: directory into which to copy src.  Must be an
-            existing directory.
-    """
-    try:
-        if src.is_file():
-            shutil.copy(src, dstdir)
-        else:
-            for srcfile in src.iterdir():
-                destfile = dstdir / srcfile.name
-                if srcfile.is_dir():
-                    shutil.copytree(srcfile, destfile, dirs_exist_ok=True)
-                else:
-                    shutil.copy(srcfile, destfile)
-    except OSError as exc:
-        # FIXME why is this specific error special-cased
-        if exc.errno == errno.ENOENT:
-            raise ProgramError(f'File not found when copying program:\n {exc.filename}')
-        raise
-
-
-def list_files_recursive(root: Path) -> list[Path]:
-    """List files in a directory with subdirectories.
+    Symlinks are not followed.
 
     Returns:
-        paths of all files contained in a directory and its
-        subdirectories.
+        an error message listing everything else (symlinks, fifos, sockets,
+        devices, ...) found in build_dir, or None if there is nothing else.
     """
-    ret: list[Path] = []
-    for path, _, files in os.walk(root):
-        ret.extend(Path(path) / filename for filename in files)
-    return ret
+    special = []
+    for path, dirnames, filenames in os.walk(build_dir):
+        for name in dirnames + filenames:
+            entry = Path(path) / name
+            mode = entry.lstat().st_mode
+            if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
+                special.append(entry.relative_to(build_dir))
+    if not special:
+        return None
+    names = ', '.join(str(path) for path in sorted(special))
+    return f'Build produced something other than regular files and directories: {names}'

@@ -2,28 +2,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..languages import Language, Languages
-from .paths import RelativePath, relpath, resolve
+from .files import EntryKind, Files
+from .paths import RelativePath, relpath
+from .program_files import ProgramFiles, load_program_files
 
 #: Pseudo-language whose include files are added for every language.
 DEFAULT_LANGUAGE = 'default'
 
 
 @dataclass(frozen=True)
-class IncludeFile:
-    """A single include file.
+class LanguageIncludes:
+    """Include files for a language.
 
-    `path` is relative to the include directory for its language, e.g. for
+    File paths are relative to the include directory for the language, e.g. for
     include/cpp/Vector/Vector.h, path is Vector/Vector.h.
     """
 
-    path: RelativePath
-    data: bytes
-
-
-@dataclass(frozen=True)
-class LanguageIncludes:
-    mainfile: str | None = None
-    files: list[IncludeFile] = field(default_factory=list)
+    mainfile: RelativePath | None = None
+    files: ProgramFiles = field(default_factory=ProgramFiles)
 
 
 @dataclass(frozen=True)
@@ -38,35 +34,30 @@ class Includes:
     def get_includes_for_language(self, language: str) -> LanguageIncludes:
         """All includes relevant for `language`: the files registered for
         DEFAULT_LANGUAGE (which apply to every language) plus those registered
-        for `language` itself, with the mainfile taken from `language`.
+        for `language` itself, with the mainfile taken from `language`. Where
+        paths coincide, the file registered for `language` wins.
         """
         default_includes = self.languages.get(DEFAULT_LANGUAGE, LanguageIncludes())
         lang_includes = self.languages.get(language, LanguageIncludes())
-        return LanguageIncludes(mainfile=lang_includes.mainfile, files=default_includes.files + lang_includes.files)
+        return LanguageIncludes(mainfile=lang_includes.mainfile, files=default_includes.files.merged(lang_includes.files))
 
 
-def load_includes(probdir: Path, language_config: Languages) -> Includes:
-    include_dir = resolve(probdir) / 'include'
+def load_includes(files: Files, language_config: Languages) -> Includes:
     includes = Includes()
-    if not include_dir.is_dir():
-        return includes
-
-    for lang_dir in sorted(include_dir.iterdir()):
-        if lang_dir.is_dir():
-            language = language_config.get(lang_dir.name)
-            includes.languages[lang_dir.name] = _load_language_includes(lang_dir, language)
+    for lang_dir in files.listdir(files.root / 'include', EntryKind.DIR):
+        language = language_config.get(lang_dir.name)
+        includes.languages[lang_dir.name] = _load_language_includes(files, lang_dir, language)
     return includes
 
 
-def _load_language_includes(lang_dir: Path, language: Language | None) -> LanguageIncludes:
-    paths = sorted(p for p in lang_dir.rglob('*') if p.is_file())
-    files = [IncludeFile(path=relpath(path.relative_to(lang_dir)), data=path.read_bytes()) for path in paths]
+def _load_language_includes(files: Files, lang_dir: Path, language: Language | None) -> LanguageIncludes:
+    program_files = load_program_files(files, lang_dir)
 
-    mainfile = None
+    mainfile: RelativePath | None = None
     if language is not None:
-        source_files = language.get_source_files(paths)
+        source_files = language.get_source_files([f.path for f in program_files.files])
         candidates = language.mainfile_candidates(source_files)
         if candidates:
-            mainfile = str(Path(candidates[0]).relative_to(lang_dir))
+            mainfile = relpath(candidates[0])
 
-    return LanguageIncludes(mainfile=mainfile, files=files)
+    return LanguageIncludes(mainfile=mainfile, files=program_files)

@@ -13,7 +13,7 @@ from typing import Any
 
 from ..metadata import Metadata
 from ..model import TestCase
-from ..run import Program
+from ..run import BuildRun, Program, SourceCode
 from .result import SubmissionResult
 
 
@@ -145,9 +145,16 @@ class ResultCache:
 
     _CACHE_DIR = '/tmp/problemtools/cache'
 
-    def __init__(self) -> None:
+    def __init__(self, sub: Program, output_validator: Program) -> None:
         os.makedirs(self._CACHE_DIR, exist_ok=True)
         self._file_hashes: dict[Path, str] = {}
+        # The programs don't change during a run, so hash their identity once up front.
+        h = hashlib.sha256()
+        h.update(b'lang:')
+        self._hash_program(h, sub)
+        h.update(b'\x00val:')
+        self._hash_program(h, output_validator)
+        self._programs_digest = h.hexdigest()
 
     def _hash_file_content(self, path: Path) -> str:
         digest = self._file_hashes.get(path)
@@ -160,32 +167,39 @@ class ResultCache:
             self._file_hashes[path] = digest
         return digest
 
-    def _hash_program(self, h: hashlib._Hash, program: Program) -> None:
-        """Mix a program's identity into h: its language plus the contents of its sources.
+    @staticmethod
+    def _hash_program(h: hashlib._Hash, program: Program) -> None:
+        """Mix a program's identity into h: its language plus the contents of its files.
 
-        Programs that aren't source code (e.g. the bundled default validator) have neither
-        attribute; fall back to the name, which is stable for those."""
-        language = getattr(program, 'language', None)
-        h.update((language.lang_id if language is not None else program.name).encode())
-        for src_file in sorted(getattr(program, 'src', [])):
-            src_path = Path(src_file)
-            h.update(src_path.name.encode())
-            h.update(self._hash_file_content(src_path).encode())
+        Programs that aren't source code or build/run scripts (e.g. the bundled default
+        validator) have neither; fall back to the name, which is stable for those."""
+        if isinstance(program, SourceCode):
+            h.update(program.language.lang_id.encode())
+            # Include files are compiled in with the program, so they're part of its identity.
+            files = program._all_files()
+        elif isinstance(program, BuildRun):
+            h.update(b'buildrun')
+            files = program.files
+        else:
+            h.update(program.name.encode())
+            return
+        for file in files.files:
+            h.update(b'\x00')
+            h.update(str(file.path).encode())
+            h.update(b'\x01' if file.executable else b'\x00')
+            h.update(hashlib.sha256(file.data).hexdigest().encode())
 
-    def _make_key(self, sub: Program, testcase: TestCase, output_validator: Program, metadata: Metadata) -> str:
+    def _make_key(self, testcase: TestCase, metadata: Metadata) -> str:
         h = hashlib.sha256()
 
-        h.update(b'lang:')
-        self._hash_program(h, sub)
+        h.update(b'programs:')
+        h.update(self._programs_digest.encode())
 
         h.update(b'\x00in:')
         h.update(self._hash_file_content(testcase.infile).encode())
 
         h.update(b'\x00ans:')
         h.update(self._hash_file_content(testcase.ansfile).encode())
-
-        h.update(b'\x00val:')
-        self._hash_program(h, output_validator)
 
         h.update(b'\x00vflags:')
         # TestCase.output_validator_flags already has the problem-level legacy flags merged in.
@@ -208,13 +222,11 @@ class ResultCache:
 
     def lookup(
         self,
-        sub: Program,
         testcase: TestCase,
-        output_validator: Program,
         metadata: Metadata,
         timelim_high: float,
     ) -> SubmissionResult | None:
-        key = self._make_key(sub, testcase, output_validator, metadata)
+        key = self._make_key(testcase, metadata)
         data = self._read_entry(os.path.join(self._CACHE_DIR, f'{key}.json'))
         if data is None:
             return None
@@ -254,14 +266,12 @@ class ResultCache:
 
     def store(
         self,
-        sub: Program,
         testcase: TestCase,
-        output_validator: Program,
         metadata: Metadata,
         timelim_high: float,
         res_high: SubmissionResult,
     ) -> None:
-        key = self._make_key(sub, testcase, output_validator, metadata)
+        key = self._make_key(testcase, metadata)
         path = os.path.join(self._CACHE_DIR, f'{key}.json')
         if self._stored_timelim(path) > timelim_high:
             # Keep the entry measured at the higher limit: it is strictly more informative.
