@@ -12,9 +12,8 @@ repository](https://github.com/Kattis/problem-package-format).
 
 This repository is a fork Kattis' `problemtools`. It improves support for larger problems with multiple subtasks:
 
-* **Live rich table:** Submission results are shown in a live-updating terminal table, with submissions as rows and test case groups as columns (arguably an improvement over Thore Husfeldt's `analyzetestgroups.sh`. Does not suppoer EXPECTED_GRADE though).
+* **Live rich table:** Submission results are shown in a live-updating terminal table, with submissions as rows and test case groups as columns (arguably an improvement over Thore Husfeldt's `analyzetestgroups.sh`. Does not support EXPECTED_GRADE though). Can also show per-group score via `--score`, which is useful for problems where you get non-binary scoring per gorup.
 * **Result caching:** Adds a `--cache` flag that caches results of running a particular submission on a test case cross-runs.
-* **Subtask scoring view:** The subtask table also supports `--score` flag to show per-subtask scores instead of runtimes.
 * **Precision column:** For problems with `float_tolerance`, the subtask table adds a `Precision` column showing the largest error over all test cases.
 
 
