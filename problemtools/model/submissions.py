@@ -3,27 +3,45 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
+import yaml
+
+from ..formatversion import FormatVersion
+from ..globs import Glob
 from ..languages import Languages
 from ..metadata import Metadata
 from ..run import SourceCode
-from ..submission_rules import FinalVerdictRule, PermittedRule, Rule, ScoreRule
+from ..submission_rules import FinalVerdictRule, PermittedRule, RequiredRule, Rule, ScoreRule
 from .files import EntryKind, Files
 from .includes import Includes
 from .paths import RelativePath, relpath
-from .programs import find_source_programs
+from .programs import get_source_program
+from .submissions_policy import SubmissionsEntry, SubmissionsPolicy, TimeLimitBound, parse_submissions_yaml
 from .testdata import TestDataGroup
 
 
 @dataclass(frozen=True)
 class Submission:
-    """A single example submission.
+    """A single example submission, and what's expected of it.
 
     `path` is relative to the submissions directory, e.g. for
-    submissions/accepted/hello.java, path is accepted/hello.java."""
+    submissions/accepted/hello.java, path is accepted/hello.java.
+
+    `rules` is empty if nothing is expected of the submission, e.g. for a legacy problem
+    when it's not in a well-known directory. That's an error, and such a submission is ignored.
+
+    `rules` and `time_limit_bounds` are tuples rather than lists to keep Submission hashable,
+    as it's used as a dict key.
+
+    `language_overridden` is whether the program's language was set by submissions.yaml
+    rather than auto-detected."""
 
     program: SourceCode
     path: RelativePath
+    rules: tuple[Rule, ...]
+    time_limit_bounds: tuple[TimeLimitBound, ...]
+    language_overridden: bool = False
 
     def __post_init__(self) -> None:
         if len(self.path.parts) != 2:
@@ -39,79 +57,174 @@ class Submission:
 
 
 @dataclass(frozen=True)
-class LegacyPolicy:
-    """The directory-name-based policy for what's expected of a submission, used by problem
-    formats that predate submissions.yaml: everything is inferred purely from which of the
-    well-known directories (if any) a submission's path starts with.
-
-    Problemtools has traditionally only checked a submission's final verdict, so that's an
-    error, while violating the (stricter) per test case expectations is only a warning.
-    """
-
-    def rules_for(self, submission: Submission, testdata: TestDataGroup, metadata: Metadata) -> list[Rule] | None:
-        """The rules for this submission, or None if it isn't in a well-known directory."""
-        match submission.directory:
-            case 'accepted':
-                # show_details=False: when the final verdict is wrong, the permitted rule shows the failing test case
-                rules: list[Rule] = [
-                    PermittedRule(verdicts=frozenset({'AC'}), is_error=False),
-                    FinalVerdictRule(verdict='AC', show_details=False),
-                ]
-                if metadata.is_scoring():
-                    best = _best_score(testdata, metadata)
-                    # For some heuristic problems, not attaining full score is expected. Thus, only warn.
-                    if math.isfinite(best):
-                        hint = 'if full score is attainable, consider moving it to partially_accepted'
-                        rules.append(ScoreRule(min_score=best, max_score=best, is_error=False, hint=hint))
-                return rules
-            case 'partially_accepted':
-                rules = [FinalVerdictRule(verdict='AC')]
-                if metadata.is_scoring():
-                    min_score, max_score = testdata.get_score_range()
-                    hint = 'consider moving it to accepted'
-                    # If the best score is infinite, so is the bound (inf - 0.01 == inf), and the rule accepts any score
-                    if metadata.legacy_grading.objective == 'min':
-                        rules.append(ScoreRule(min_score=min_score + 0.01, max_score=max_score, is_error=False, hint=hint))
-                    else:
-                        rules.append(ScoreRule(min_score=min_score, max_score=max_score - 0.01, is_error=False, hint=hint))
-                return rules
-            case 'wrong_answer':
-                return [
-                    PermittedRule(verdicts=frozenset({'AC', 'WA'}), is_error=False),
-                    FinalVerdictRule(verdict='WA', show_details=False),
-                ]
-            case 'time_limit_exceeded':
-                return [
-                    PermittedRule(verdicts=frozenset({'AC', 'WA', 'TLE'}), is_error=False),
-                    # Details are needed when the final verdict is WA, which the permitted rule allows
-                    FinalVerdictRule(verdict='TLE'),
-                ]
-            case 'run_time_error':
-                return [FinalVerdictRule(verdict='RTE')]
-            case _:
-                return None
-
-    def lower_bounds_time_limit(self, submission: Submission) -> bool:
-        """Whether this submission's runtime should be used to lower-bound the time limit."""
-        return submission.directory == 'accepted'
-
-
-@dataclass(frozen=True)
 class Submissions:
-    """All example submissions for a problem."""
+    """All example submissions for a problem, and the policy their expectations come from."""
 
+    policy: SubmissionsPolicy
     submissions: list[Submission] = field(default_factory=list)
-    policy: LegacyPolicy = field(default_factory=LegacyPolicy)
 
 
-def load_submissions(files: Files, language_config: Languages, includes: Includes) -> Submissions:
+def load_submissions(
+    files: Files, language_config: Languages, includes: Includes, testdata: TestDataGroup, metadata: Metadata
+) -> Submissions:
+    parsed_entries, parse_errors = _load_submissions_yaml(files, language_config)
+    policy = SubmissionsPolicy(entries=_default_entries(testdata, metadata) + parsed_entries, parse_errors=parse_errors)
     submissions = []
-    for entry in files.listdir(files.root / 'submissions', EntryKind.DIR):
-        for program in find_source_programs(files, entry, language_config=language_config, includes=includes):
-            submissions.append(Submission(program=program, path=relpath(Path(entry.name) / program.name)))
-    return Submissions(submissions=submissions)
+    for directory in files.listdir(files.root / 'submissions', EntryKind.DIR):
+        for program_path in files.listdir(directory):
+            path = relpath(Path(directory.name) / program_path.name)
+            matching = policy.entries_for(path)
+            # Conflicting values are an error reported by checks, so which one we pick doesn't matter
+            language_codes = [entry.language for entry in matching if entry.language is not None]
+            language = language_config.languages[language_codes[-1]] if language_codes else None
+            entrypoints = [entry.entrypoint for entry in matching if entry.entrypoint is not None]
+            program = get_source_program(
+                files,
+                program_path,
+                language_config,
+                includes=includes,
+                language=language,
+                entrypoint_override=entrypoints[-1] if entrypoints else None,
+            )
+            if program is None:
+                continue
+            submissions.append(
+                Submission(
+                    program=program,
+                    path=path,
+                    rules=tuple(rule for entry in matching for rule in entry.rules),
+                    time_limit_bounds=tuple(bound for entry in matching for bound in entry.time_limit_bounds),
+                    language_overridden=language is not None,
+                )
+            )
+    return Submissions(policy=policy, submissions=submissions)
 
 
-def _best_score(testdata: TestDataGroup, metadata: Metadata) -> float:
+def _load_submissions_yaml(files: Files, language_config: Languages) -> tuple[list[SubmissionsEntry], list[str]]:
+    """The entries from submissions/submissions.yaml (if any), and errors from parsing it."""
+    path = files.root / 'submissions' / 'submissions.yaml'
+    if not files.is_file(path):
+        return [], []
+    try:
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except UnicodeDecodeError as e:
+        return [], [f'not valid UTF-8: {e}']
+    except yaml.YAMLError as e:
+        return [], [f'invalid YAML: {e}']
+    return parse_submissions_yaml(data, language_config.languages.keys())
+
+
+def _default_entries(testdata: TestDataGroup, metadata: Metadata) -> list[SubmissionsEntry]:
+    """The expectations from the problem format's default directories."""
+    match metadata.problem_format_version:
+        case FormatVersion.LEGACY:
+            return _legacy_entries(testdata, metadata)
+        case FormatVersion.V_2023_07:
+            return _entries_2023_07(testdata, metadata)
+
+
+def _legacy_entries(testdata: TestDataGroup, metadata: Metadata) -> list[SubmissionsEntry]:
+    """The directory-name-based expectations used by problem formats that predate submissions.yaml.
+
+    Problemtools has traditionally only checked a submission's final verdict, so that's an error,
+    while violating the (stricter) per test case expectations is only a warning. Likewise,
+    time_limit_exceeded doesn't upper bound the time limit, as a TLE submission running close to
+    the time limit has traditionally only given a warning (about time limit sensitivity).
+    """
+    # show_details=False: when the final verdict is wrong, the permitted rule shows the failing test case
+    accepted: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC'}), is_error=False),
+        FinalVerdictRule(verdict='AC', show_details=False),
+        *_best_score_rules(testdata, metadata),
+    ]
+    wrong_answer: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'WA'}), is_error=False),
+        FinalVerdictRule(verdict='WA', show_details=False),
+    ]
+    time_limit_exceeded: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'WA', 'TLE'}), is_error=False),
+        # Details are needed when the final verdict is WA, which the permitted rule allows
+        FinalVerdictRule(verdict='TLE'),
+    ]
+    run_time_error: list[Rule] = [FinalVerdictRule(verdict='RTE')]
+
+    return [
+        _default_entry('accepted', accepted, 'lower'),
+        _default_entry('partially_accepted', _partially_accepted_rules(testdata, metadata)),
+        _default_entry('wrong_answer', wrong_answer),
+        _default_entry('time_limit_exceeded', time_limit_exceeded),
+        _default_entry('run_time_error', run_time_error),
+    ]
+
+
+def _entries_2023_07(testdata: TestDataGroup, metadata: Metadata) -> list[SubmissionsEntry]:
+    """The default directories from the 2023-07 specification.
+
+    We extend the specification with the legacy partially_accepted directory, and for scoring
+    problems, with a warning when an accepted submission doesn't get the best score."""
+    accepted: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC'})),
+        *_best_score_rules(testdata, metadata),
+    ]
+    rejected: list[Rule] = [RequiredRule(verdicts=frozenset({'RTE', 'TLE', 'WA'}))]
+    wrong_answer: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'WA'})),
+        RequiredRule(verdicts=frozenset({'WA'})),
+    ]
+    time_limit_exceeded: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'TLE'})),
+        RequiredRule(verdicts=frozenset({'TLE'})),
+    ]
+    run_time_error: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'RTE'})),
+        RequiredRule(verdicts=frozenset({'RTE'})),
+    ]
+    brute_force: list[Rule] = [
+        PermittedRule(verdicts=frozenset({'AC', 'RTE', 'TLE'})),
+        RequiredRule(verdicts=frozenset({'RTE', 'TLE'})),
+    ]
+
+    return [
+        _default_entry('accepted', accepted, 'lower'),
+        _default_entry('partially_accepted', _partially_accepted_rules(testdata, metadata)),
+        _default_entry('rejected', rejected),
+        _default_entry('wrong_answer', wrong_answer),
+        _default_entry('time_limit_exceeded', time_limit_exceeded, 'upper'),
+        _default_entry('run_time_error', run_time_error),
+        _default_entry('brute_force', brute_force),
+    ]
+
+
+def _default_entry(
+    directory: str, rules: list[Rule], time_limit_bound: Literal['lower', 'upper'] | None = None
+) -> SubmissionsEntry:
+    """A default entry for all submissions in `directory`, optionally bounding the time limit on all test data."""
+    bounds = [] if time_limit_bound is None else [TimeLimitBound(scope=Glob(''), direction=time_limit_bound)]
+    return SubmissionsEntry(glob=Glob(directory), rules=rules, time_limit_bounds=bounds, is_default=True)
+
+
+def _best_score_rules(testdata: TestDataGroup, metadata: Metadata) -> list[Rule]:
+    """For scoring problems, a warning if an accepted submission doesn't get the best score."""
+    if not metadata.is_scoring():
+        return []
     min_score, max_score = testdata.get_score_range()
-    return min_score if metadata.legacy_grading.objective == 'min' else max_score
+    best = min_score if metadata.legacy_grading.objective == 'min' else max_score
+    # For some heuristic problems, not attaining full score is expected. Thus, only warn.
+    if not math.isfinite(best):
+        return []
+    hint = 'if full score is attainable, consider moving it to partially_accepted'
+    return [ScoreRule(min_score=best, max_score=best, is_error=False, hint=hint)]
+
+
+def _partially_accepted_rules(testdata: TestDataGroup, metadata: Metadata) -> list[Rule]:
+    """Accepted, and for scoring problems, a warning if the submission gets the best score."""
+    rules: list[Rule] = [FinalVerdictRule(verdict='AC')]
+    if metadata.is_scoring():
+        min_score, max_score = testdata.get_score_range()
+        hint = 'consider moving it to accepted'
+        # If the best score is infinite, so is the bound (inf - 0.01 == inf), and the rule accepts any score
+        if metadata.legacy_grading.objective == 'min':
+            rules.append(ScoreRule(min_score=min_score + 0.01, max_score=max_score, is_error=False, hint=hint))
+        else:
+            rules.append(ScoreRule(min_score=min_score, max_score=max_score - 0.01, is_error=False, hint=hint))
+    return rules

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
+from functools import cached_property
 from re import Pattern
 from typing import Any
 
@@ -32,6 +34,16 @@ class TestCase:
     def __str__(self) -> str:
         return f'testcase {self.path}'
 
+    @cached_property
+    def input_sha256(self) -> bytes:
+        """sha256 of the input file contents. Computed on first access."""
+        return _file_digest(self.infile)
+
+    @cached_property
+    def answer_sha256(self) -> bytes:
+        """sha256 of the answer file contents. Computed on first access."""
+        return _file_digest(self.ansfile)
+
     def matches_filter(self, filter_re: Pattern[str]) -> bool:
         return filter_re.search(str(self.path)) is not None
 
@@ -40,6 +52,11 @@ class TestCase:
 
     def get_all_testcases(self) -> list[TestCase]:
         return [self]
+
+
+def _file_digest(path: AbsolutePath) -> bytes:
+    with open(path, 'rb') as f:
+        return hashlib.file_digest(f, lambda: hashlib.sha256(usedforsecurity=False)).digest()
 
 
 @dataclass(frozen=True)
@@ -61,7 +78,7 @@ class TestDataGroup:
     items: list[TestCase | TestDataGroup] = field(default_factory=list)
 
     def __str__(self) -> str:
-        return f'testcase group {self.name}'
+        return f'testcase group {"data" if self.is_root else self.path}'
 
     def matches_filter(self, filter_re: Pattern[str]) -> bool:
         return True
@@ -76,6 +93,13 @@ class TestDataGroup:
         result: list[TestCase] = []
         for item in self.items:
             result.extend(item.get_all_testcases())
+        return result
+
+    def get_all_groups(self) -> list[TestDataGroup]:
+        """This group and all groups below it."""
+        result = [self]
+        for subgroup in self.get_subgroups():
+            result.extend(subgroup.get_all_groups())
         return result
 
     def has_custom_groups(self) -> bool:

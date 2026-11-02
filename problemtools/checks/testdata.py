@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import collections
-import hashlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 from ..context import Context
@@ -46,7 +45,7 @@ def check_testdata(
     all_testcases = testdata.get_all_testcases()
     included_testcases = [tc for tc in all_testcases if tc.matches_filter(context.data_filter)]
     ignored_testcases = len(all_testcases) - len(included_testcases)
-    group_count = sum(1 for g in _all_groups(testdata) if not g.is_root)
+    group_count = sum(1 for g in testdata.get_all_groups() if not g.is_root)
     msg = f'Checking {pluralize(len(included_testcases), "test case")} in {pluralize(group_count, "test data group")}'
     if ignored_testcases:
         msg += f' (ignoring {pluralize(ignored_testcases, "case")} due to filters)'
@@ -82,16 +81,9 @@ def check_testdata(
     _check_answers(testdata, context, metadata, output_validator, work_dir, diag)
 
 
-def _all_groups(group: TestDataGroup) -> Iterator[TestDataGroup]:
-    """`group` and all its descendant groups."""
-    yield group
-    for subgroup in group.get_subgroups():
-        yield from _all_groups(subgroup)
-
-
 def _warn_reject_score(testdata: TestDataGroup, diag: Diagnostics) -> None:
     """Warn about reject_score usage."""
-    groups = list(_all_groups(testdata))
+    groups = testdata.get_all_groups()
 
     nonzero_reject = [(g, g.config['reject_score']) for g in groups if g.config['reject_score'] != 0]
     if nonzero_reject:
@@ -282,9 +274,7 @@ def _check_group(
         for testcase in group.get_all_testcases():
             if testcase.infile.is_symlink():
                 continue
-            with open(testcase.infile, 'rb') as f:
-                digest = hashlib.file_digest(f, lambda: hashlib.sha256(usedforsecurity=False)).digest()
-            hashes[digest].append(testcase.infile.relative_to(files.root))
+            hashes[testcase.input_sha256].append(testcase.infile.relative_to(files.root))
         for identical in hashes.values():
             if len(identical) > 1:
                 diag.warning(

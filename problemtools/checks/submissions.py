@@ -7,15 +7,17 @@ import math
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 from ..context import Context
 from ..diagnostics import Diagnostics, pluralize
 from ..judge import SubmissionJudge, SubmissionResult, SubmissionsJudge
 from ..metadata import FormatVersion, Metadata
-from ..model import DEFAULT_VALIDATOR, Graders, LegacyPolicy, Submission, Submissions, TestDataGroup
+from ..model import DEFAULT_VALIDATOR, Graders, Submission, Submissions, SubmissionsPolicy, TestCase, TestDataGroup
+from ..model.paths import RelativePath
 from ..results_table import SubtaskResultsTable, get_table_groups
 from ..run import Program
-from ..submission_rules import FinalVerdictRule, Rule
+from ..submission_rules import FinalVerdictRule, PermittedRule, RequiredRule, ScoreRule
 
 
 def check_submissions(
@@ -31,9 +33,11 @@ def check_submissions(
     diag: Diagnostics,
 ) -> None:
     """Run all checks on a problem's submissions."""
-    policy = submissions.policy
-    rules_by_submission = _check_matches_policy(submissions, policy, testdata, metadata, diag)
-    known_submissions = list(rules_by_submission)
+    _check_policy(submissions.policy, metadata, diag)
+    _check_globs_match(submissions.policy, [sub.path for sub in submissions.submissions], testdata, diag)
+    _check_language_and_entrypoint(submissions, diag)
+    _check_time_limit_bounds_consistent(submissions, diag)
+    known_submissions = _check_has_rules(submissions, diag)
     included_submissions = [s for s in known_submissions if context.submission_filter.search(str(s.path))]
     ignored_submissions = len(known_submissions) - len(included_submissions)
     msg = f'Checking {pluralize(len(included_submissions), "submission")}'
@@ -85,10 +89,9 @@ def check_submissions(
             )
 
             timelim, timelim_high, fixed_limit = _initial_time_limit(metadata, context, diag)
-            lower_bound_submissions = [sub for sub in included_submissions if policy.lower_bounds_time_limit(sub)]
+            lower_bound_submissions = [sub for sub in included_submissions if _has_time_limit_bound(sub, 'lower')]
             all_submission_results = _check_submission_group(
                 lower_bound_submissions,
-                rules_by_submission,
                 metadata,
                 submissions_judge,
                 probdir,
@@ -116,18 +119,14 @@ def check_submissions(
             if results_table is not None:
                 results_table.set_timelim(timelim)
 
-            # Run TLE submissions last (as they're presumably the slowest)
+            # Run submissions that may time out last, as they are presumably the slowest
             rest = sorted(
                 (sub for sub in included_submissions if sub not in lower_bound_submissions),
-                key=lambda sub: (
-                    any(isinstance(r, FinalVerdictRule) and r.verdict == 'TLE' for r in rules_by_submission[sub]),
-                    str(sub.path),
-                ),
+                key=lambda sub: (_may_time_out(sub), str(sub.path)),
             )
             all_submission_results.extend(
                 _check_submission_group(
                     rest,
-                    rules_by_submission,
                     metadata,
                     submissions_judge,
                     probdir,
@@ -152,25 +151,99 @@ def _check_has_accepted_submission(submissions: Submissions, diag: Diagnostics) 
         diag.error('Require at least one "accepted" submission')
 
 
-def _check_matches_policy(
-    submissions: Submissions, policy: LegacyPolicy, testdata: TestDataGroup, metadata: Metadata, diag: Diagnostics
-) -> dict[Submission, list[Rule]]:
-    """Get the rules for every submission matching the policy. Emit an error for, and exclude, any
-    submission that doesn't match the policy at all (i.e. sits in an unrecognized directory). Such
-    a submission is never compiled or tested."""
-    rules_by_submission = {}
+def _check_time_limit_bounds_consistent(submissions: Submissions, diag: Diagnostics) -> None:
     for sub in submissions.submissions:
-        rules = policy.rules_for(sub, testdata, metadata)
-        if rules is not None:
-            rules_by_submission[sub] = rules
+        if _has_time_limit_bound(sub, 'lower') and _has_time_limit_bound(sub, 'upper'):
+            diag.error(f'Submission {sub.path} is used to both lower and upper bound the time limit')
+
+
+def _may_time_out(sub: Submission) -> bool:
+    """Whether sub's rules mention TLE as an acceptable outcome, or it upper bounds the time limit."""
+    for rule in sub.rules:
+        if isinstance(rule, PermittedRule | RequiredRule) and 'TLE' in rule.verdicts:
+            return True
+        if isinstance(rule, FinalVerdictRule) and rule.verdict == 'TLE':
+            return True
+    return _has_time_limit_bound(sub, 'upper')
+
+
+def _has_time_limit_bound(sub: Submission, direction: Literal['lower', 'upper']) -> bool:
+    return any(bound.direction == direction for bound in sub.time_limit_bounds)
+
+
+def _check_policy(policy: SubmissionsPolicy, metadata: Metadata, diag: Diagnostics) -> None:
+    """Check the policy itself, i.e. the default entries combined with those from submissions.yaml."""
+    for error in policy.parse_errors:
+        diag.error(f'submissions.yaml: {error}')
+
+    user_entries = [entry for entry in policy.entries if not entry.is_default]
+    if metadata.problem_format_version == FormatVersion.LEGACY and (user_entries or policy.parse_errors):
+        diag.warning(
+            f'submissions.yaml is not part of problem format version {FormatVersion.LEGACY}, '
+            'but is supported by problemtools as an extension'
+        )
+
+    for entry in user_entries:
+        if entry.entrypoint is not None:
+            diag.warning(f"submissions.yaml: '{entry.glob}': entrypoint is not supported yet (ignoring it)")
+        if not metadata.is_scoring() and any(isinstance(rule, ScoreRule) for rule in entry.rules):
+            diag.error(f"submissions.yaml: '{entry.glob}': score is only allowed for scoring problems")
+
+
+def _check_globs_match(
+    policy: SubmissionsPolicy, submission_paths: list[RelativePath], testdata: TestDataGroup, diag: Diagnostics
+) -> None:
+    """Warn about globs in submissions.yaml that don't match anything, which is likely a mistake."""
+    testcases = testdata.get_all_testcases()
+    nodes: list[TestCase | TestDataGroup] = [*testcases, *testdata.get_all_groups()]
+    for entry in policy.entries:
+        if entry.is_default:
+            continue
+        if not any(entry.glob.covers(path) for path in submission_paths):
+            diag.warning(f"submissions.yaml: '{entry.glob}' does not match any submission")
+
+        unmatched: set[str] = set()
+        for rule in entry.rules:
+            if not any(rule.applies_to(node) for node in nodes):
+                unmatched.add(f'test data {"group " if isinstance(rule, ScoreRule) else ""}glob {rule.scope.pattern!r}')
+        for bound in entry.time_limit_bounds:
+            if not any(bound.scope.covers(tc.path) for tc in testcases):
+                unmatched.add(f'test data glob {bound.scope.pattern!r}')
+        for what in sorted(unmatched):
+            diag.warning(f"submissions.yaml: '{entry.glob}': {what} does not match any test data")
+
+
+def _check_language_and_entrypoint(submissions: Submissions, diag: Diagnostics) -> None:
+    for sub in submissions.submissions:
+        matching = submissions.policy.entries_for(sub.path)
+        for key, values in [
+            ('language', {entry.language for entry in matching if entry.language is not None}),
+            ('entrypoint', {entry.entrypoint for entry in matching if entry.entrypoint is not None}),
+        ]:
+            if len(values) > 1:
+                diag.error(f'submissions.yaml: conflicting {key} for submission {sub.path}: {", ".join(sorted(values))}')
+        if sub.program.entrypoint_override is not None and sub.program.has_include_mainfile:
+            diag.warning(
+                f'submissions.yaml: entrypoint for submission {sub.path} is ignored, as the include files give a main file'
+            )
+
+
+def _check_has_rules(submissions: Submissions, diag: Diagnostics) -> list[Submission]:
+    """Get every submission with rules. Emit an error for, and exclude, any submission without
+    rules (e.g. one that sits in an unrecognized directory). Such a submission is never compiled or tested."""
+    with_rules = []
+    for sub in submissions.submissions:
+        if sub.rules:
+            with_rules.append(sub)
         else:
-            diag.error(f'Submission {sub.path} does not match any known submissions directory; ignoring it')
-    return rules_by_submission
+            diag.error(
+                f'Submission {sub.path} is not in a known submissions directory, and not matched by submissions.yaml; ignoring it'
+            )
+    return with_rules
 
 
 def _check_submission_group(
     subs: list[Submission],
-    rules_by_submission: dict[Submission, list[Rule]],
     metadata: Metadata,
     submissions_judge: SubmissionsJudge,
     probdir: Path,
@@ -197,7 +270,8 @@ def _check_submission_group(
 
         result = outcomes[sub]
         if not result.success:
-            diag.error(f'Compile error for {sub}', additional_info=result.errmsg)
+            hint = f' (language set to {sub.program.language.lang_id} by submissions.yaml)' if sub.language_overridden else ''
+            diag.error(f'Compile error for {sub}{hint}', additional_info=result.errmsg)
             continue
 
         if not has_testcases:
@@ -207,7 +281,6 @@ def _check_submission_group(
         sub_results = _check_submission(
             sub,
             judge,
-            rules_by_submission[sub],
             metadata,
             probdir,
             seen_oob_score_groups,
@@ -215,24 +288,23 @@ def _check_submission_group(
             timelim_high,
             diag,
             results_table,
-            _table_category(sub, rules_by_submission[sub]),
+            _table_category(sub),
         )
         submission_results.append((sub, sub_results))
 
     return submission_results
 
 
-def _table_category(sub: Submission, rules: list[Rule]) -> str:
+def _table_category(sub: Submission) -> str:
     """Which verdict group the submission's row belongs to in the live results table."""
     if sub.directory == 'partially_accepted':
         return 'PAC'
-    return next((r.verdict for r in rules if isinstance(r, FinalVerdictRule) and r.scope == ''), 'AC')
+    return next((r.verdict for r in sub.rules if isinstance(r, FinalVerdictRule) and not r.scope.pattern), 'AC')
 
 
 def _check_submission(
     sub: Submission,
     judge: SubmissionJudge,
-    rules: list[Rule],
     metadata: Metadata,
     probdir: Path,
     seen_oob_score_groups: set[int],
@@ -258,7 +330,8 @@ def _check_submission(
     time_limit_sensitivity = _time_limit_sensitivity(judge, results_high, timelim, timelim_high, sub, metadata)
 
     # Use a list rather than any() on a generator, so that every rule gets checked
-    reported_errors = [rule.check(sub, results, diag) for rule in rules]
+    reported_errors = [rule.check(sub, results, diag) for rule in sub.rules]
+    reported_errors.append(_check_upper_bounds(sub, results_high, timelim_high, diag))
     if time_limit_sensitivity is not None:
         if any(reported_errors):
             # Already reported as an error, but knowing how the result depends on the time limit may help fix it
@@ -273,6 +346,27 @@ def _check_submission(
         results_table.add_row(sub, results, label)
 
     return results
+
+
+def _check_upper_bounds(sub: Submission, results_high: list[SubmissionResult], timelim_high: float, diag: Diagnostics) -> bool:
+    """A submission upper bounding the time limit must time out with the high time limit on some test case in
+    the bound's scope. Like RequiredRule, there's no violation if no test case in scope was judged. Returns
+    whether an error was reported."""
+    reported_error = False
+    for bound in sub.time_limit_bounds:
+        if bound.direction != 'upper':
+            continue
+        in_scope = [r for r in results_high if isinstance(r.test_node, TestCase) and bound.scope.covers(r.test_node.path)]
+        if not in_scope or any(r.verdict == 'TLE' for r in in_scope):
+            continue
+        where = f' in {bound.scope}' if bound.scope.pattern else ''
+        slowest = max(r.runtime for r in in_scope)
+        diag.error(
+            f'{sub} is used to upper bound the time limit, but its slowest runtime{where} ({_fmt_number(slowest)}s) '
+            f'is within the safety margin ({_fmt_number(timelim_high)}s)'
+        )
+        reported_error = True
+    return reported_error
 
 
 def _check_score_in_bounds(
@@ -420,7 +514,18 @@ def _compute_time_limit(
     diag: Diagnostics,
 ) -> tuple[float, float]:
     limits = metadata.limits
-    lower_bound_runtime = max(results[-1].runtime for _, results in all_submission_results)
+    # The slowest runtime on a test case covered by a lower bound
+    lower_bound_runtime = max(
+        (
+            r.runtime
+            for sub, results in all_submission_results
+            for bound in sub.time_limit_bounds
+            if bound.direction == 'lower'
+            for r in results
+            if isinstance(r.test_node, TestCase) and bound.scope.covers(r.test_node.path)
+        ),
+        default=0.0,
+    )
     exact_timelim = lower_bound_runtime * limits.time_multipliers.ac_to_time_limit
     tl_from_runtime = max(1, math.ceil(exact_timelim / limits.time_resolution)) * limits.time_resolution
 

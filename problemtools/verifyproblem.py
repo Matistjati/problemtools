@@ -151,11 +151,8 @@ class ProblemVerifier:
             # runs even if the 'validators' part wasn't requested. Program.compile() caches
             # its result, so this is harmless if 'validators' already queued the same compile.
             context.submit_background_work(get_output_validator().compile, work_dir)
-            policy = problem.submissions.policy
             for sub in problem.submissions.submissions:
-                if policy.rules_for(sub, problem.testdata, problem.metadata) is not None and context.submission_filter.search(
-                    str(sub.path)
-                ):
+                if sub.rules and context.submission_filter.search(str(sub.path)):
                     context.submit_background_work(sub.program.compile, work_dir)
 
         return [
@@ -167,13 +164,24 @@ class ProblemVerifier:
                 ),
             ),
             _CheckStep(
+                'judge',
+                'judge',
+                lambda diag: checks.check_judge(problem.metadata, problem.files, problem.testdata, problem.attachments, diag),
+            ),
+            _CheckStep(
                 'statement',
                 'statement',
                 lambda diag: checks.check_statements(
                     problem.statements, problem.metadata, problem.format_version, problem.files, work_dir, diag
                 ),
             ),
-            _CheckStep('statement', 'attachments', lambda diag: checks.check_attachments(problem.attachments, diag)),
+            _CheckStep(
+                'statement',
+                'attachments',
+                lambda diag: checks.check_attachments(
+                    problem.attachments, problem.files, problem.metadata, problem.language_config, diag
+                ),
+            ),
             _CheckStep(
                 'validators',
                 'input_validator',
@@ -217,7 +225,7 @@ class ProblemVerifier:
             _CheckStep(
                 'submissions',
                 'includes',
-                lambda diag: checks.check_includes(problem.includes, problem.language_config, problem.format_version, diag),
+                lambda diag: checks.check_includes(problem.includes, problem.language_config, problem.metadata, diag),
             ),
             _CheckStep(
                 'submissions',
