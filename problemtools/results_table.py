@@ -265,7 +265,11 @@ class SubtaskResultsTable:
         style = self._VERDICT_STYLE.get(verdict, 'white')
         if verdict == 'AC':
             if self._show_subtask_scores:
-                score_str = f'{res.score:.2f}' if res.score is not None else ''
+                score_str = ''
+                if res.score is not None:
+                    score_str = f'{res.score:.2f}'
+                    if score_str.endswith('.00'):
+                        score_str = score_str[:-1]  # show whole scores as x.0, not x.00
                 return Text.assemble((score_str, 'green'))
             elif res.runtime >= 0:
                 return Text.assemble((f'{res.runtime:.2f}s', 'green'))
